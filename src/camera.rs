@@ -1,23 +1,20 @@
 use anyhow::{Context, Result};
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{
-    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-    Resolution,
-};
+use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 
 pub struct CameraCapture {
     camera: Camera,
     target_width: u32,
     target_height: u32,
-    captured_width: u32,
-    captured_height: u32,
+    native_width: u32,
+    native_height: u32,
     raw_buffer: Vec<u8>,
 }
 
 impl CameraCapture {
-    pub fn new(index: u32, target_width: u32, target_height: u32, fps: u32) -> Result<Self> {
-        // Query available cameras to assist debugging if index fails
+    pub fn new(index: u32, target_width: u32, target_height: u32, _fps: u32) -> Result<Self> {
+        // Query available cameras to assist debugging
         if let Ok(devices) = nokhwa::query(ApiBackend::Auto) {
             println!("Found {} video input device(s):", devices.len());
             for dev in devices {
@@ -26,16 +23,20 @@ impl CameraCapture {
         }
 
         let cam_index = CameraIndex::Index(index);
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
-            CameraFormat::new(
-                Resolution::new(target_width, target_height),
-                FrameFormat::RAWRGB,
-                fps,
-            ),
-        ));
 
-        let mut camera = Camera::new(cam_index, requested)
-            .context("Failed to initialize camera with requested format")?;
+        // MediaFoundation webcams reject strict format matching like FrameFormat::RAWRGB.
+        // We request None so the driver selects its native supported format (e.g. MJPEG/YUY2).
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+
+        let mut camera = match Camera::new(cam_index.clone(), requested) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: RequestedFormatType::None failed ({:?}), trying AbsoluteHighestFrameRate fallback...", e);
+                let fallback = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+                Camera::new(cam_index, fallback)
+                    .context("Failed to initialize camera with default or fallback format")?
+            }
+        };
 
         camera.open_stream().context("Failed to open camera stream")?;
 
@@ -46,8 +47,8 @@ impl CameraCapture {
             camera,
             target_width,
             target_height,
-            captured_width: res.width(),
-            captured_height: res.height(),
+            native_width: res.width(),
+            native_height: res.height(),
             raw_buffer: vec![0u8; buffer_size],
         })
     }
@@ -57,31 +58,60 @@ impl CameraCapture {
     }
 
     pub fn native_resolution(&self) -> (u32, u32) {
-        (self.captured_width, self.captured_height)
+        (self.native_width, self.native_height)
     }
 
-    /// Captures a frame and ensures it is delivered in 320x240 RGB format
-    /// reusing the internal memory buffer to avoid allocations in the hot loop.
+    /// Captures a frame and delivers it in exact 320x240 RGB format.
+    /// Uses zero-heap-allocation nearest-neighbor downsampling directly into the pre-allocated buffer.
     pub fn capture_frame(&mut self) -> Result<&[u8]> {
         let frame = self.camera.frame().context("Failed to grab camera frame")?;
         let decoded = frame
             .decode_image::<RgbFormat>()
             .context("Failed to decode frame into RGB format")?;
 
-        if decoded.width() == self.target_width && decoded.height() == self.target_height {
-            let raw = decoded.as_raw();
-            self.raw_buffer.copy_from_slice(raw);
+        let src_raw = decoded.as_raw();
+        let src_w = decoded.width();
+        let src_h = decoded.height();
+
+        if src_w == self.target_width && src_h == self.target_height {
+            self.raw_buffer.copy_from_slice(src_raw);
         } else {
-            // Downsample to target 320x240 if camera driver returned a higher native resolution
-            let resized = image::imageops::resize(
-                &decoded,
-                self.target_width,
-                self.target_height,
-                image::imageops::FilterType::Nearest, // Fastest downsample for low CPU usage
+            // High-speed, zero-allocation downsample to 320x240 directly into pre-allocated memory
+            resize_nearest_rgb(
+                src_raw,
+                src_w as usize,
+                src_h as usize,
+                &mut self.raw_buffer,
+                self.target_width as usize,
+                self.target_height as usize,
             );
-            self.raw_buffer.copy_from_slice(resized.as_raw());
         }
 
         Ok(&self.raw_buffer)
+    }
+}
+
+/// Zero-allocation nearest-neighbor downsampling for packed RGB buffers
+#[inline]
+fn resize_nearest_rgb(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) {
+    for y in 0..dst_h {
+        let src_y = (y * src_h) / dst_h;
+        let src_row_start = src_y * src_w * 3;
+        let dst_row_start = y * dst_w * 3;
+
+        for x in 0..dst_w {
+            let src_x = (x * src_w) / dst_w;
+            let src_idx = src_row_start + src_x * 3;
+            let dst_idx = dst_row_start + x * 3;
+
+            dst[dst_idx..dst_idx + 3].copy_from_slice(&src[src_idx..src_idx + 3]);
+        }
     }
 }
