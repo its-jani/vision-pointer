@@ -6,17 +6,26 @@ the foundation (Phase 1) for a gesture-driven control system.
 
 ## Overview
 
-The program opens the default webcam, grabs a stream of frames, decodes them
-into RGB, and downsamples each frame into a pre-allocated buffer. It then
-prints rolling and average FPS so the capture pipeline can be measured.
+The program opens the default webcam, negotiates the cheapest stream the driver can
+actually deliver at the requested frame rate, pumps frames on a dedicated capture
+thread, and downsamples each one into a pre-allocated buffer. It then prints rolling
+and average FPS so the capture pipeline can be measured.
 
 ## Features
 
 - **Webcam capture** via [`nokhwa`](https://github.com/l15n42pw1r/nokhwa) using the auto/MediaFoundation backend.
+- **Format negotiation** — the driver's full format list is scored and the stream with the
+  best frame rate per USB byte is requested (640x480 MJPEG @ 30 FPS in preference to the
+  1280x720 raw default).
+- **Threaded frame pump** — a capture thread owns the device, decodes and downsamples, then
+  publishes into a mailbox; the consumer takes the newest frame without stalling on driver I/O.
+  If the pump cannot start, it falls back to blocking capture on the calling thread.
 - **Zero-copy / zero-allocation frames** — RGB data is written into a pre-allocated buffer reused across frames.
 - **Nearest-neighbor downsampling** implemented without extra heap allocations.
-- **Format fallback** — if the native format request fails, it retries with `AbsoluteHighestFrameRate`.
 - **FPS benchmarking** — per-frame timing, rolling FPS, and average FPS output.
+
+Measured on a *XiaoMi USB 2.0 Webcam*: negotiating 640x480 MJPEG @ 30 FPS over the threaded
+pump lifts the loop from ~9.6 FPS (native 1280x720) to ~30 FPS steady / 27.6 FPS average.
 
 ## Architecture
 
@@ -29,7 +38,7 @@ src/
 | Module | Responsibility |
 | ------ | -------------- |
 | `main.rs` | Initializes the camera and runs the capture/benchmark loop. |
-| `camera.rs` | Encapsulates camera access, frame decoding, and downsampling into `CameraCapture`. |
+| `camera.rs` | Format negotiation, the capture thread + frame mailbox, decoding, and downsampling behind `CameraCapture`. |
 
 ## Requirements
 
@@ -63,38 +72,40 @@ run may take a moment.
 
 ## How It Works
 
-1. `CameraCapture::new(0, 320, 240, 20)` opens camera index `0`, targeting a
-   `320x240` processing buffer.
+1. `CameraCapture::new(0, 320, 240, 30)` opens camera index `0`, targeting a
+   `320x240` processing buffer at 30 FPS.
 2. Available video devices are enumerated and printed.
-3. The camera stream is opened with the driver's native format; a fallback
-   format is attempted if the initial request fails.
-4. For each of `100` frames:
-   - The frame is grabbed and decoded into RGB.
-   - If the source resolution differs from the target, it is downsampled
-     into the pre-allocated buffer.
-   - Every `20` frames, buffer size, frame capture time, rolling FPS, and
-     average FPS are printed.
-5. A summary of total frames, elapsed time, and average FPS is printed at the
-   end.
+3. The driver's advertised format list is scored (`format_score`) — frame rate first, then
+   the 640x480 pixel budget, then wire format (MJPEG > NV12/YUYV > raw RGB) — and the winner
+   is requested with `RequestedFormatType::Exact`.
+4. A capture thread opens the stream, and per frame it decodes to RGB, downsamples into its
+   own fixed buffer, bumps a sequence counter and signals a condvar.
+5. The loop reads the newest published frame and every `20` frames prints buffer size,
+   frame capture time, rolling FPS, and average FPS.
+6. A summary of total frames, elapsed time, average FPS, and the >= 20 FPS verdict is printed.
 
 ## Configuration
 
 Adjust behavior by editing the arguments in `src/main.rs`:
 
 ```rust
-let mut cam = CameraCapture::new(0, 320, 240, 20)?;
+let mut cam = CameraCapture::new(0, 320, 240, 30)?;
 //                                ^   ^   ^   ^
 //                          index  w   h  fps (target)
 ```
 
 - **Camera index** — select a different webcam (`0` is the default).
 - **Target width / height** — processing buffer dimensions.
+- **`fps`** — the frame-rate target the negotiation scores formats against.
 - **`max_frames`** — number of frames captured during the benchmark.
+- Tuning constants live at the top of `src/camera.rs` (`NATIVE_MAX_WIDTH`/`HEIGHT`,
+  `MIN_ACCEPTABLE_FPS`, `FRAME_TIMEOUT`).
 
 ## What's Next
 
-Phase 1 focuses on the capture pipeline. Future phases are expected to layer
-gesture recognition and pointer control on top of these RGB frames.
+Phase 1 (capture pipeline) is complete and running at ~30 FPS. Phase 2 layers ONNX Runtime
+hand-landmark extraction on top of the pumped RGB frames, followed by gesture recognition
+and pointer control.
 
 ## License
 

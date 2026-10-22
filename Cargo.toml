@@ -7,3 +7,5 @@ edition = "2024"
 anyhow = "1.0.104"
 image = "0.25.10"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
+ort = { version = "2.0.0-rc.15", features = ["download-binaries"] }
+ureq = "2"
