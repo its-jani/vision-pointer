@@ -8,7 +8,6 @@ use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::ValueType;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// One downloadable model asset.
@@ -18,23 +17,27 @@ pub struct ModelSpec {
     pub urls: &'static [&'static str],
 }
 
+// Both assets are `static` so `missing_models()` can hand out `&'static ModelSpec` without
+// relying on rvalue static promotion of a `const`.
+//
+// Only the float32 conversions are listed: the decoder extracts `f32` outputs, so an int8 variant
+// would be saved under the float file name and then silently mis-parsed.
+
 /// Stage 1: locates palms in the frame and gives the 7 points used to orient the hand crop.
-pub const PALM: ModelSpec = ModelSpec {
+pub static PALM: ModelSpec = ModelSpec {
     label: "palm detection",
     file_name: "palm_detection_mediapipe_2023feb.onnx",
     urls: &[
         "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/main/palm_detection_mediapipe_2023feb.onnx",
-        "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/main/palm_detection_mediapipe_2023feb_int8.onnx",
     ],
 };
 
 /// Stage 2: consumes the rotated, cropped hand and returns the 21 landmarks.
-pub const LANDMARK: ModelSpec = ModelSpec {
+pub static LANDMARK: ModelSpec = ModelSpec {
     label: "hand landmark",
     file_name: "handpose_estimation_mediapipe_2023feb.onnx",
     urls: &[
         "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb.onnx",
-        "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb_int8.onnx",
     ],
 };
 
@@ -54,7 +57,7 @@ pub fn path_for(spec: &ModelSpec) -> PathBuf {
 
 /// Specs that are not present on disk yet.
 pub fn missing_models() -> Vec<&'static ModelSpec> {
-    [(&PALM as &'static ModelSpec), (&LANDMARK as &'static ModelSpec)]
+    [&PALM, &LANDMARK]
         .into_iter()
         .filter(|spec| !path_for(spec).is_file())
         .collect()
@@ -181,30 +184,20 @@ pub fn describe_models(environment: &Environment) -> Result<()> {
         }
         let session = open_session(environment, spec)?;
         println!("{}: {}", spec.label, path.display());
-        print_io("  input", session.inputs())?;
-        print_io("  output", session.outputs())?;
+        print_io("input", session.inputs());
+        print_io("output", session.outputs());
         let _ = session;
     }
     Ok(())
 }
 
-fn print_io(kind: &str, outlets: &[ort::value::Outlet]) -> Result<()> {
+fn print_io(kind: &str, outlets: &[ort::value::Outlet]) {
     for outlet in outlets {
+        // `Shape` derefs to `[i64]` and implements `Display`, so it prints as `[1, 3, 192, 192]`.
         let (dtype, shape) = match outlet.dtype() {
-            ValueType::Tensor { ty, shape, .. } => (format!("{ty:?}"), format!("{:?}", shape.dimensions())),
+            ValueType::Tensor { ty, shape, .. } => (format!("{ty:?}"), format!("{shape}")),
             other => (format!("{other:?}"), String::from("-")),
         };
         println!("  {kind}: {} : {dtype} {shape}", outlet.name());
     }
-    Ok(())
-}
-
-/// Reads a whole file into memory; used by the self-test path only.
-pub fn read_file(path: &Path) -> Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    fs::File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?
-        .read_to_end(&mut buffer)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    Ok(buffer)
 }
