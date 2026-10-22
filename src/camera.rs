@@ -206,10 +206,6 @@ impl CameraCapture {
         (self.target_width as u32, self.target_height as u32)
     }
 
-    pub fn native_resolution(&self) -> (u32, u32) {
-        (self.stream.width, self.stream.height)
-    }
-
     pub fn stream_info(&self) -> &StreamInfo {
         &self.stream
     }

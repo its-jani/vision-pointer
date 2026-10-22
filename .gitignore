@@ -1,1 +1,5 @@
 /target
+target/
+/models
+*.onnx
+*.onnx.part

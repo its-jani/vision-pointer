@@ -31,22 +31,6 @@ impl Affine {
         Self { tx: dx, ty: dy, ..Self::IDENTITY }
     }
 
-    /// Maps coordinates of a region whose top-left corner is `(x, y)` back to the parent space.
-    pub fn offset_of(crop: &Rect) -> Self {
-        Self::translation(crop.x, crop.y)
-    }
-
-    /// Scales about an arbitrary pivot: `pivot + (p - pivot) * factor`.
-    pub fn scale_about(pivot: (f64, f64), factor: f64) -> Self {
-        Self {
-            a: factor,
-            d: factor,
-            tx: pivot.0 * (1.0 - factor),
-            ty: pivot.1 * (1.0 - factor),
-            ..Self::IDENTITY
-        }
-    }
-
     /// Mirrors `cv2.getRotationMatrix2D(center, angle_degrees, 1.0)`.
     ///
     /// OpenCV treats `M` as source -> destination, so sampling the rotated image at a destination
@@ -81,12 +65,6 @@ impl Affine {
             self.a * point.0 + self.b * point.1 + self.tx,
             self.c * point.0 + self.d * point.1 + self.ty,
         )
-    }
-
-    pub fn apply_slice(&self, points: &mut [(f64, f64)]) {
-        for point in points.iter_mut() {
-            *point = self.apply(*point);
-        }
     }
 
     /// Inverse of a rigid (rotation + translation, unit scale) transform.
@@ -167,25 +145,6 @@ impl Rect {
         self.enlarged(factor, factor)
     }
 
-    pub fn clamped_to_image(&self, image_w: usize, image_h: usize) -> Rect {
-        let x0 = self.x.clamp(0.0, image_w as f64);
-        let y0 = self.y.clamp(0.0, image_h as f64);
-        let x1 = (self.x + self.w).clamp(0.0, image_w as f64);
-        let y1 = (self.y + self.h).clamp(0.0, image_h as f64);
-        Rect::from_corners(x0, y0, x1, y1)
-    }
-
-    /// The square region that encloses this rectangle, centred on it - the crop-plus-pad step.
-    /// `side` overrides the square size (MediaPipe uses the diagonal before rotation) and returns
-    /// the transform that maps square coordinates into image coordinates.
-    pub fn square_pad(&self, image_w: usize, image_h: usize, side_override: Option<f64>) -> (Rect, Affine) {
-        let clamped = self.clamped_to_image(image_w, image_h);
-        let side = side_override.unwrap_or_else(|| clamped.w.max(clamped.h)).ceil().max(1.0);
-        let center = clamped.center();
-        let square = Rect::new(center.0 - side / 2.0, center.1 - side / 2.0, side, side);
-        (square, Affine::offset_of(&square))
-    }
-
     /// Transform mapping a destination box of `out_size` into this rectangle's image space.
     pub fn map_from_unit_box(&self, out_w: usize, out_h: usize) -> Affine {
         Affine {
@@ -195,13 +154,6 @@ impl Rect {
             ty: self.y,
             ..Affine::IDENTITY
         }
-    }
-
-    pub fn contains(&self, point: (f64, f64)) -> bool {
-        point.0 >= 0.0
-            && point.1 >= 0.0
-            && point.0 < self.w
-            && point.1 < self.h
     }
 }
 
@@ -271,24 +223,43 @@ pub enum Layout {
     Planar,
 }
 
+/// A borrowed packed RGB (0..=255) image the resampler reads from.
+///
+/// Grouping the bytes with their dimensions keeps the sampling entry points down to a handful of
+/// arguments and stops width/height from being threaded through the pipeline separately.
+#[derive(Copy, Clone, Debug)]
+pub struct Source<'a> {
+    pub pixels: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Source<'_> {
+    /// Wraps RGB bytes, rejecting a buffer whose length disagrees with the dimensions.
+    pub fn rgb(pixels: &[u8], width: usize, height: usize) -> Option<Source<'_>> {
+        if width == 0 || height == 0 || pixels.len() != width * height * 3 {
+            return None;
+        }
+        Some(Source { pixels, width, height })
+    }
+}
+
 /// Packs RGB (0..=255) into the `float32` 0..=1 blob the MediaPipe graphs expect.
 ///
 /// `mapping` takes a destination pixel `(x, y)` and returns where it came from in the source
-/// frame; a `None` result becomes black.
+/// frame; a sample outside the source becomes black.
 ///
 /// Bilinear for mapping scale < 1 (rotations, and small upscales of a 640x480 source), box
 /// averaging for downscales: nearest on its own would alias badly on the palm stage, where the
 /// 320x240 letterbox into 192x192 is a downscale.
 pub fn write_blob(
-    source: &[u8],
-    source_w: usize,
-    source_h: usize,
+    source: Source<'_>,
     mapping: &Affine,
-    out_w: usize,
-    out_h: usize,
+    out: (usize, usize),
     layout: Layout,
     dest: &mut [f32],
 ) {
+    let (out_w, out_h) = out;
     debug_assert_eq!(dest.len(), out_w * out_h * 3);
     // `mapping` maps destination -> source, so `a > 1` means the destination is a downscale.
     let downscale = mapping.a > 1.05 || mapping.d > 1.05;
@@ -300,17 +271,10 @@ pub fn write_blob(
         for out_x in 0..out_w {
             let mut rgb = [0.0f32; 3];
             if use_box {
-                sample_box(
-                    source,
-                    source_w,
-                    source_h,
-                    mapping,
-                    (out_x, out_y),
-                    &mut rgb,
-                );
+                sample_box(source, mapping, (out_x, out_y), &mut rgb);
             } else {
                 let (sx, sy) = mapping.apply((out_x as f64 + 0.5, out_y as f64 + 0.5));
-                sample_bilinear(source, source_w, source_h, sx - 0.5, sy - 0.5, &mut rgb);
+                sample_bilinear(source, sx - 0.5, sy - 0.5, &mut rgb);
             }
             match layout {
                 Layout::Interleaved => {
@@ -329,9 +293,7 @@ pub fn write_blob(
 }
 
 fn sample_box(
-    source: &[u8],
-    source_w: usize,
-    source_h: usize,
+    source: Source<'_>,
     mapping: &Affine,
     out: (usize, usize),
     dest: &mut [f32],
@@ -347,8 +309,8 @@ fn sample_box(
     let y0 = src_y0.max(0.0).floor() as usize;
     let x1 = src_x1.max(0.0).ceil() as usize;
     let y1 = src_y1.max(0.0).ceil() as usize;
-    let x1 = x1.min(source_w);
-    let y1 = y1.min(source_h);
+    let x1 = x1.min(source.width);
+    let y1 = y1.min(source.height);
     if x1 <= x0 || y1 <= y0 {
         dest.copy_from_slice(&[0.0, 0.0, 0.0]);
         return;
@@ -367,9 +329,10 @@ fn sample_box(
                 continue;
             }
             let weight = cover_x * cover_y;
-            let index = (sy * source_w + sx) * 3;
-            for channel in 0..3 {
-                sums[channel] += f64::from(source[index + channel]) * weight;
+            let index = (sy * source.width + sx) * 3;
+            let pixel = &source.pixels[index..index + 3];
+            for (sum, channel) in sums.iter_mut().zip(pixel) {
+                *sum += f64::from(*channel) * weight;
             }
             weights += weight;
         }
@@ -379,20 +342,13 @@ fn sample_box(
         return;
     }
     let divisor = weights * 255.0;
-    for channel in 0..3 {
-        dest[channel] = (sums[channel] / divisor) as f32;
+    for (value, sum) in dest.iter_mut().zip(sums) {
+        *value = (sum / divisor) as f32;
     }
 }
 
-fn sample_bilinear(
-    source: &[u8],
-    source_w: usize,
-    source_h: usize,
-    fx: f64,
-    fy: f64,
-    dest: &mut [f32],
-) {
-    if fx < -1.0 || fy < -1.0 || fx > source_w as f64 || fy > source_h as f64 {
+fn sample_bilinear(source: Source<'_>, fx: f64, fy: f64, dest: &mut [f32]) {
+    if fx < -1.0 || fy < -1.0 || fx > source.width as f64 || fy > source.height as f64 {
         dest.copy_from_slice(&[0.0, 0.0, 0.0]);
         return;
     }
@@ -402,11 +358,11 @@ fn sample_bilinear(
     let wy = fy - y0 as f64;
 
     let pixel = |x: i64, y: i64| -> Option<[u8; 3]> {
-        if x < 0 || y < 0 || x >= source_w as i64 || y >= source_h as i64 {
+        if x < 0 || y < 0 || x >= source.width as i64 || y >= source.height as i64 {
             return None;
         }
-        let index = (y as usize * source_w + x as usize) * 3;
-        Some([source[index], source[index + 1], source[index + 2]])
+        let index = (y as usize * source.width + x as usize) * 3;
+        Some([source.pixels[index], source.pixels[index + 1], source.pixels[index + 2]])
     };
 
     let p00 = pixel(x0, y0);
@@ -421,7 +377,7 @@ fn sample_bilinear(
         let bottom = v(p01) * (1.0 - wx) + v(p11) * wx;
         top * (1.0 - wy) + bottom * wy
     };
-    for channel in 0..3 {
-        dest[channel] = (mix(channel) / 255.0) as f32;
+    for (channel, value) in dest.iter_mut().enumerate() {
+        *value = (mix(channel) / 255.0) as f32;
     }
 }
