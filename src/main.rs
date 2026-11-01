@@ -1,4 +1,6 @@
 mod camera;
+mod controller;
+mod filter;
 mod hands;
 mod model;
 mod palm_anchors;
@@ -6,7 +8,8 @@ mod roi;
 
 use anyhow::{Result, bail};
 use camera::CameraCapture;
-use hands::{Hand, HandPipeline, Timings};
+use controller::MouseController;
+use hands::{Hand, HandPipeline, Posture, Timings};
 use std::fmt::Write as _;
 use std::time::Instant;
 
@@ -27,6 +30,11 @@ struct Flags {
     frames: u32,
     max_hands: usize,
     min_confidence: f64,
+    alpha: f32,
+    margin: f32,
+    pinch: f32,
+    no_mirror: bool,
+    dry_run: bool,
     force: bool,
 }
 
@@ -38,6 +46,11 @@ impl Default for Flags {
             frames: 0,
             max_hands: 1,
             min_confidence: hands::HAND_PRESENCE_THRESHOLD,
+            alpha: filter::DEFAULT_ALPHA,
+            margin: controller::ACTIVE_MARGIN,
+            pinch: controller::PINCH_CLICK_DISTANCE,
+            no_mirror: false,
+            dry_run: false,
             force: false,
         }
     }
@@ -61,6 +74,11 @@ impl Flags {
                 "--frames" => flags.frames = number(flag, value(&mut index, &rest, flag)?)?,
                 "--max-hands" => flags.max_hands = number(flag, value(&mut index, &rest, flag)?)?,
                 "--min-confidence" => flags.min_confidence = number(flag, value(&mut index, &rest, flag)?)?,
+                "--alpha" => flags.alpha = number(flag, value(&mut index, &rest, flag)?)?,
+                "--margin" => flags.margin = number(flag, value(&mut index, &rest, flag)?)?,
+                "--pinch" => flags.pinch = number(flag, value(&mut index, &rest, flag)?)?,
+                "--no-mirror" => flags.no_mirror = true,
+                "--dry-run" => flags.dry_run = true,
                 "--force" => flags.force = true,
                 "-h" | "--help" => flags.command = String::from("help"),
                 other => bail!("unknown option `{other}` - run `cargo run --release -- help`"),
@@ -95,6 +113,7 @@ fn main() -> Result<()> {
     match flags.command.as_str() {
         "bench" => bench(&flags),
         "hands" => hands(&flags),
+        "run" => run(&flags),
         "fetch-models" => fetch_models(&flags),
         "describe" => describe(),
         "help" => {
@@ -117,19 +136,29 @@ Usage:
 Commands (default: bench)
   bench          Capture {BENCH_FRAMES} frames and report the camera pipeline framerate
   hands          Run the two-stage landmark pipeline over the live camera feed
+  run            Drive the OS cursor from the index fingertip, pinch to click
   fetch-models   Download the ONNX assets into ./models (nothing is fetched automatically)
   describe       Print the input/output tensor contract of the installed models
   help           Show this message
 
 Options
   --camera N          Camera device index (default: 0)
-  --frames N          Stop after N frames, 0 runs until interrupted (hands only)
+  --frames N          Stop after N frames, 0 runs until interrupted (hands/run only)
   --max-hands N       Palm boxes promoted to hands per frame (default: 1)
   --min-confidence F  Landmark score a hand needs to be reported, 0-1 (default: 0.5)
+  --alpha F           Cursor smoothing weight, 0-1: higher follows the hand, lower is glassy
+                      (default: {DEFAULT_ALPHA})
+  --margin F          Active margin inset per frame edge, 0-0.45 (default: {ACTIVE_MARGIN})
+  --pinch F           Pinch distance that clicks, in frame fractions (default: {PINCH_CLICK_DISTANCE})
+  --no-mirror         Do not flip the horizontal axis (the cursor follows the raw camera view)
+  --dry-run           Compute and print the cursor position without moving the real cursor
   --force             Re-download models that are already present (fetch-models only)
 
 Environment
-  VISION_POINTER_MODELS   Directory holding the .onnx assets (default: ./models)"
+  VISION_POINTER_MODELS   Directory holding the .onnx assets (default: ./models)",
+        DEFAULT_ALPHA = filter::DEFAULT_ALPHA,
+        ACTIVE_MARGIN = controller::ACTIVE_MARGIN,
+        PINCH_CLICK_DISTANCE = controller::PINCH_CLICK_DISTANCE,
     );
 }
 
@@ -262,6 +291,170 @@ fn hands(flags: &Flags) -> Result<()> {
     println!("Hands seen in a frame: {detected}");
     println!("------------------------------------------------------------");
     Ok(())
+}
+
+/// Phase 3: point the OS cursor with the index fingertip and click on a pinch.
+fn run(flags: &Flags) -> Result<()> {
+    let environment = model::init_environment()?;
+    let mut pipeline = HandPipeline::new(&environment)?
+        .with_max_hands(flags.max_hands)?
+        .with_hand_threshold(flags.min_confidence);
+    let mut pointer = MouseController::new()?
+        .with_alpha(flags.alpha)
+        .with_margin(flags.margin)
+        .with_pinch_distance(flags.pinch)
+        .with_mirror(!flags.no_mirror)
+        .with_dry_run(flags.dry_run);
+    let mut camera = open_camera(flags, "Gesture Daemon - Phase 3: Pointer Control")?;
+
+    let (width, height) = camera.resolution();
+    let (display_w, display_h) = pointer.display_size();
+    println!(
+        "\nPointer ready: frame {width}x{height} on a {display_w}x{display_h} display | {}{}\nCtrl-C stops.\n",
+        pointer.tuning(),
+        if flags.dry_run { " | dry run: the real cursor stays put" } else { "" }
+    );
+
+    let started = Instant::now();
+    let mut window = Instant::now();
+    let mut frames_in_window = 0u32;
+    let mut captured = 0u32;
+    let mut pointing_frames = 0u32;
+    let mut clicks = 0u32;
+    loop {
+        if flags.frames > 0 && captured >= flags.frames {
+            break;
+        }
+        let frame = camera.capture_frame()?;
+        let infer_started = Instant::now();
+        let hands = pipeline.detect(frame, width, height)?;
+        let elapsed = infer_started.elapsed().as_secs_f64() * 1000.0;
+        captured += 1;
+        frames_in_window += 1;
+        let fps = frames_in_window as f64 / window.elapsed().as_secs_f64();
+
+        // The most confident hand steers. Anything else in view is ignored rather than allowed to
+        // fight the cursor for control.
+        let pilot = hands.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+        let report = match pilot {
+            None => {
+                // Tracking dropped out: forget the smoothing history, so a hand that reappears
+                // across the frame does not drag the cursor along an exponential path to it.
+                pointer.reset();
+                PointerReport {
+                    frame: captured,
+                    hand: None,
+                    posture: Posture::default(),
+                    pinch: 0.0,
+                    pointing: false,
+                    position: None,
+                    clicked: false,
+                    timings: pipeline.timings(),
+                    elapsed,
+                    fps,
+                }
+            }
+            Some(hand) => {
+                let pinch = hand.pinch_distance(width, height);
+                // A pinch curls the index finger, so it is scored on every tracked frame rather
+                // than only while pointing.
+                let clicked = pointer.process_click(pinch);
+                clicks += u32::from(clicked);
+                let posture = hand.posture();
+                let pointing = posture.pointing();
+                if pointing {
+                    let tip = hand.tip();
+                    pointer.map_and_move(tip.x as f32, tip.y as f32, width, height)?;
+                }
+                // Otherwise the cursor stays where it is; the filter keeps its history so the
+                // pointer glides back to the fingertip when pointing resumes.
+                pointing_frames += u32::from(pointing);
+                PointerReport {
+                    frame: captured,
+                    hand: Some(hand),
+                    posture,
+                    pinch,
+                    pointing,
+                    position: pointer.last_position(),
+                    clicked,
+                    timings: pipeline.timings(),
+                    elapsed,
+                    fps,
+                }
+            }
+        };
+        // Print every frame that moves or clicks, plus a heartbeat so a still camera does not look
+        // frozen.
+        if report.pointing || report.clicked || captured.is_multiple_of(FPS_WINDOW) {
+            pointer_readout(&report);
+        }
+        if captured.is_multiple_of(FPS_WINDOW) {
+            window = Instant::now();
+            frames_in_window = 0;
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("\n------------------------------------------------------------");
+    println!("Frames processed:   {captured}");
+    println!("Framerate:          {:.1} FPS", captured as f64 / elapsed);
+    println!("Pointing frames:    {pointing_frames}");
+    println!("Clicks injected:    {clicks}{}", if flags.dry_run { " (dry run)" } else { "" });
+    println!("------------------------------------------------------------");
+    Ok(())
+}
+
+/// One frame's worth of pointer state, gathered for the status line.
+struct PointerReport {
+    frame: u32,
+    hand: Option<Hand>,
+    posture: Posture,
+    pinch: f32,
+    /// Whether the pointing posture engaged this frame, and so whether the cursor was sent anywhere.
+    pointing: bool,
+    /// Screen coordinate the cursor was last sent to; still reported while pointing is off, because
+    /// that is where the cursor is holding.
+    position: Option<(i32, i32)>,
+    clicked: bool,
+    timings: Timings,
+    elapsed: f64,
+    fps: f64,
+}
+
+/// Prints `[Pointing: Active | Smoothed X, Y | Pinch Dist | Click]`.
+fn pointer_readout(report: &PointerReport) {
+    let mut line = format!("Frame {:>5} | ", report.frame);
+    match (report.hand, report.pointing) {
+        (Some(hand), true) => {
+            let (x, y) = report.position.unwrap_or((0, 0));
+            let _ = write!(line, "Pointing: Active | Smoothed ({x}, {y}) | Pinch {:.3}", report.pinch);
+            if report.clicked {
+                line.push_str(" | Click");
+            }
+            let _ = write!(
+                line,
+                " | {:?} conf {:.2} | {:.1} ms ({:.1} palm + {:.1} hand) | {:.1} FPS",
+                hand.handedness,
+                hand.score,
+                report.elapsed,
+                report.timings.palm_ms,
+                report.timings.hand_ms,
+                report.fps
+            );
+        }
+        // Tracked but not aimed: the posture explains why the cursor is holding still.
+        (Some(hand), false) => {
+            let _ = write!(line, "Pointing: {} | Pinch {:.3} | conf {:.2}", report.posture.label(), report.pinch, hand.score);
+            if let Some((x, y)) = report.position {
+                let _ = write!(line, " | cursor holding at ({x}, {y})");
+            }
+            let _ = write!(line, " | {:.1} FPS", report.fps);
+        }
+        (None, _) => {
+            let _ = write!(line, "Pointing: Lost | no hand tracked | {:.1} FPS", report.fps);
+        }
+    }
+    println!("{}", line.trim_end());
 }
 
 fn readout(frame: u32, hands: &[Hand], timings: Timings, elapsed: f64, fps: f64) {

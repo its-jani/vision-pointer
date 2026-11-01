@@ -53,6 +53,29 @@ const INDEX_OF_MIDDLE_FINGER_BASE: usize = 2;
 const PALM_LANDMARK_COUNT: usize = 7;
 const HAND_LANDMARK_COUNT: usize = 21;
 
+// Hand landmark indices, following the MediaPipe topology the model is trained on. Index 0 is the
+// wrist; it anchors every other point but nothing here has to name it.
+const THUMB_TIP: usize = 4;
+const INDEX_FINGER_BASE: usize = 5;
+const INDEX_FINGER_PIPE: usize = 6;
+const INDEX_FINGER_TIP: usize = 8;
+const MIDDLE_FINGER_BASE: usize = 9;
+const MIDDLE_FINGER_PIPE: usize = 10;
+const MIDDLE_FINGER_TIP: usize = 12;
+const RING_FINGER_BASE: usize = 13;
+const RING_FINGER_PIPE: usize = 14;
+const RING_FINGER_TIP: usize = 16;
+const PINKY_BASE: usize = 17;
+const PINKY_PIPE: usize = 18;
+const PINKY_TIP: usize = 20;
+
+/// Tip-to-base distance above this multiple of the PIP-to-base distance means the finger is
+/// straight: an extended finger spans roughly twice its own proximal segment.
+const FINGER_EXTENDED_RATIO: f64 = 1.4;
+/// Tip-to-base distance below this multiple means the finger is curled: the tip has come back to
+/// the middle joint or further. The gap between the two ratios is the hysteresis band.
+const FINGER_FOLDED_RATIO: f64 = 1.15;
+
 /// One keypoint. Screen landmarks are in frame pixels (`z` is relative to the wrist); world
 /// landmarks are the model's metric coordinates, origin at the wrist, unit-agnostic.
 #[derive(Copy, Clone, Debug, Default)]
@@ -542,7 +565,27 @@ enum Slot {
     Unknown,
 }
 
-fn classify(name: &str, values: usize, landmarks_taken: bool) -> Slot {
+/// Which slots a previous output already claimed.
+#[derive(Copy, Clone, Debug, Default)]
+struct Taken {
+    landmarks: bool,
+    confidence: bool,
+    handedness: bool,
+}
+
+impl Taken {
+    fn mark(&mut self, slot: Slot) {
+        match slot {
+            Slot::Landmarks => self.landmarks = true,
+            Slot::Confidence => self.confidence = true,
+            Slot::Handedness => self.handedness = true,
+            // `World` needs no bookkeeping: the 63-value tensors are ordered screen first.
+            Slot::World | Slot::Unknown => {}
+        }
+    }
+}
+
+fn classify(name: &str, values: usize, taken: Taken) -> Slot {
     let lowered = name.to_ascii_lowercase();
     // `handedness` contains `hand`, and `world_landmarks` contains `landmark`, so order matters.
     if lowered.contains("world") {
@@ -552,19 +595,27 @@ fn classify(name: &str, values: usize, landmarks_taken: bool) -> Slot {
         return Slot::Handedness;
     }
     if lowered.contains("landmark") {
-        return if landmarks_taken { Slot::World } else { Slot::Landmarks };
+        return if taken.landmarks { Slot::World } else { Slot::Landmarks };
     }
     if lowered.contains("confidence") || lowered.contains("presence") || lowered.contains("score") {
         return Slot::Confidence;
     }
-    // tf2onnx exports keep generic names (`Identity`, `Identity_1`, ...), and then the element
-    // count is unambiguous for this graph: 63 screen landmarks, 1 confidence, 2 handedness scores,
-    // 63 world landmarks. Two 63-value tensors are told apart by declaration order, screen first.
+    // tf2onnx exports keep generic names. `cargo run --release -- describe` reports
+    // `Identity` [1,63], `Identity_1` [1,1], `Identity_2` [1,1], `Identity_3` [1,63], and
+    // mp_handpose.py unpacks them as `landmarks, conf, handedness, landmarks_word`, so the two
+    // scalars cannot be told apart by size: whichever scalar slot is still free wins, in
+    // declaration order.
     match values {
-        1 => Slot::Confidence,
-        2 => Slot::Handedness,
+        1 => {
+            if taken.confidence {
+                Slot::Handedness
+            } else {
+                Slot::Confidence
+            }
+        }
+        2 => Slot::Handedness, // conversions that emit a left/right logit pair
         _ if values == HAND_LANDMARK_COUNT * 3 => {
-            if landmarks_taken {
+            if taken.landmarks {
                 Slot::World
             } else {
                 Slot::Landmarks
@@ -580,17 +631,20 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
     let mut world: Option<&[f32]> = None;
     let mut confidence: Option<&[f32]> = None;
     let mut handedness: Option<&[f32]> = None;
+    let mut taken = Taken::default();
     for index in 0..names.len() {
         let (shape, data) = outputs[index]
             .try_extract_tensor::<f32>()
             .with_context(|| format!("Failed to extract hand output #{} ({})", index, names[index]))?;
-        match classify(&names[index], data.len(), screen.is_some()) {
+        let slot = classify(&names[index], data.len(), taken);
+        match slot {
             Slot::Landmarks => screen = Some(data),
             Slot::World => world = Some(data),
             Slot::Confidence => confidence = Some(data),
             Slot::Handedness => handedness = Some(data),
             Slot::Unknown => println!("Note: unrecognised hand output {} with shape {shape}", names[index]),
         }
+        taken.mark(slot);
     }
 
     let confidence = confidence.ok_or_else(|| anyhow!("the hand model exposes no confidence/presence output"))?;
@@ -599,8 +653,8 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
     if score < threshold {
         return Ok(None);
     }
-    // Index 0 of the handedness pair, as the reference reports it: probability of a left hand.
-    let left_score = handedness.map_or(0.5, |values| f64::from(values[0]));
+    // Single handedness scalar: the reference demo labels <= 0.5 "Left" and > 0.5 "Right".
+    let handedness_score = handedness.map_or(0.5, |values| f64::from(values[0]));
 
     // Blob -> frame: centre the crop, undo the reference's `max(scale_factor)` stretch, undo the
     // rotation, then step back through the big rotation into the frame (reference `_postprocess`).
@@ -648,7 +702,7 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
     Ok(Some(Hand {
         landmarks,
         world_landmarks,
-        handedness: if left_score >= 0.5 { Handedness::Left } else { Handedness::Right },
+        handedness: if handedness_score > 0.5 { Handedness::Right } else { Handedness::Left },
         score,
         bbox,
     }))
@@ -657,12 +711,85 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
 impl Hand {
     /// The index-finger tip, which is what a pointer app turns into a cursor.
     pub fn tip(&self) -> Landmark {
-        self.landmarks[8]
+        self.landmarks[INDEX_FINGER_TIP]
     }
 
     /// Index-finger tip depth from the landmark model's metric space, in its own unit.
     pub fn tip_depth(&self) -> f64 {
-        self.world_landmarks[8].z
+        self.world_landmarks[INDEX_FINGER_TIP].z
+    }
+
+    /// Thumb-tip to index-tip distance, normalised the way MediaPipe landmarks are: `x` over the
+    /// frame width, `y` over the frame height. Working in frame fractions rather than pixels keeps
+    /// the number comparable across processing resolutions; touching tips approach 0, and a hand
+    /// that fills a 320x240 frame rests near 0.1-0.2.
+    pub fn pinch_distance(&self, frame_w: u32, frame_h: u32) -> f32 {
+        let thumb = self.landmarks[THUMB_TIP];
+        let index = self.landmarks[INDEX_FINGER_TIP];
+        let dx = (thumb.x - index.x) / f64::from(frame_w.max(1));
+        let dy = (thumb.y - index.y) / f64::from(frame_h.max(1));
+        (dx * dx + dy * dy).sqrt() as f32
+    }
+
+    /// True when a finger is straight, judged from its own proportions so the answer does not
+    /// depend on how far the hand is from the camera.
+    fn finger_extended(&self, base: usize, pipe: usize, tip: usize) -> bool {
+        let ratio = self.distance(base, tip) / self.distance(base, pipe).max(1e-6);
+        ratio > FINGER_EXTENDED_RATIO
+    }
+
+    fn finger_folded(&self, base: usize, pipe: usize, tip: usize) -> bool {
+        let ratio = self.distance(base, tip) / self.distance(base, pipe).max(1e-6);
+        ratio < FINGER_FOLDED_RATIO
+    }
+
+    /// Flat distance between two keypoints, in frame pixels.
+    fn distance(&self, a: usize, b: usize) -> f64 {
+        let dx = self.landmarks[a].x - self.landmarks[b].x;
+        let dy = self.landmarks[a].y - self.landmarks[b].y;
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Which fingers are straight and which are curled.
+    pub fn posture(&self) -> Posture {
+        Posture {
+            index_extended: self.finger_extended(INDEX_FINGER_BASE, INDEX_FINGER_PIPE, INDEX_FINGER_TIP),
+            middle_folded: self.finger_folded(MIDDLE_FINGER_BASE, MIDDLE_FINGER_PIPE, MIDDLE_FINGER_TIP),
+            ring_folded: self.finger_folded(RING_FINGER_BASE, RING_FINGER_PIPE, RING_FINGER_TIP),
+            pinky_folded: self.finger_folded(PINKY_BASE, PINKY_PIPE, PINKY_TIP),
+        }
+    }
+}
+
+/// Which fingers are straight and which are curled, from the 21 screen keypoints.
+///
+/// Judged on per-finger proportions rather than absolute positions, so it survives the hand
+/// moving toward or away from the camera. Fingers inside the hysteresis band between
+/// [`FINGER_EXTENDED_RATIO`] and [`FINGER_FOLDED_RATIO`] count as neither, which keeps a
+/// half-curled finger from toggling the pointing state every frame.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Posture {
+    pub index_extended: bool,
+    pub middle_folded: bool,
+    pub ring_folded: bool,
+    pub pinky_folded: bool,
+}
+
+impl Posture {
+    /// The "index pointing" gesture: index straight, middle, ring and pinky curled.
+    pub fn pointing(&self) -> bool {
+        self.index_extended && self.middle_folded && self.ring_folded && self.pinky_folded
+    }
+
+    /// Short human-readable form for the status line.
+    pub fn label(&self) -> &'static str {
+        if self.pointing() {
+            "Pointing"
+        } else if self.index_extended {
+            "Index out"
+        } else {
+            "Open"
+        }
     }
 }
 
@@ -726,11 +853,85 @@ mod tests {
 
     #[test]
     fn hand_outputs_are_matched_by_name_then_by_size() {
-        assert_eq!(classify("world_landmarks", 63, true), Slot::World);
-        assert_eq!(classify("Identity_2", 2, true), Slot::Handedness);
-        assert_eq!(classify("Identity", 63, false), Slot::Landmarks);
-        assert_eq!(classify("Identity_1", 1, true), Slot::Confidence);
-        assert_eq!(classify("Identity_9", 7, true), Slot::Unknown);
+        let empty = Taken::default();
+        let with_landmarks = Taken { landmarks: true, ..empty };
+        let with_confidence = Taken { confidence: true, ..empty };
+        assert_eq!(classify("world_landmarks", 63, empty), Slot::World);
+        assert_eq!(classify("handedness", 1, empty), Slot::Handedness);
+        assert_eq!(classify("Identity", 63, empty), Slot::Landmarks);
+        assert_eq!(classify("Identity_3", 63, with_landmarks), Slot::World);
+        assert_eq!(classify("Identity_1", 1, empty), Slot::Confidence);
+        assert_eq!(classify("Identity_2", 1, with_confidence), Slot::Handedness);
+        assert_eq!(classify("Identity_2", 2, empty), Slot::Handedness);
+        assert_eq!(classify("Identity_9", 7, empty), Slot::Unknown);
+    }
+
+    #[test]
+    fn the_shipped_model_output_order_maps_to_the_expected_slots() {
+        // The names `cargo run --release -- describe` prints for the downloaded assets, in order:
+        // landmarks, confidence, handedness, world landmarks. Both scalars are 1 element, so this
+        // is the regression test for telling them apart.
+        let contract = [("Identity", 63usize), ("Identity_1", 1), ("Identity_2", 1), ("Identity_3", 63)];
+        let mut taken = Taken::default();
+        let mut slots = Vec::new();
+        for (name, values) in contract {
+            let slot = classify(name, values, taken);
+            slots.push(slot);
+            taken.mark(slot);
+        }
+        assert_eq!(slots, vec![Slot::Landmarks, Slot::Confidence, Slot::Handedness, Slot::World]);
+    }
+
+    /// A hand whose fingers are straight (`true`) or curled (`false`), with the segment ratios
+    /// the posture rules look for: PIP 10 px from the MCP, tip 50 px away when straight and 2 px
+    /// when curled.
+    fn synthetic_hand(index: bool, middle: bool, ring: bool, pinky: bool) -> Hand {
+        let mut landmarks = [Landmark::default(); HAND_LANDMARK_COUNT];
+        landmarks[0] = Landmark { x: 160.0, y: 200.0, z: 0.0 }; // wrist
+        landmarks[THUMB_TIP] = Landmark { x: 140.0, y: 190.0, z: 0.0 };
+        let bases: [(f64, f64); 4] = [(150.0, 150.0), (165.0, 150.0), (180.0, 152.0), (195.0, 155.0)];
+        let straight = [index, middle, ring, pinky];
+        let joints: [(usize, usize, usize); 4] = [
+            (INDEX_FINGER_BASE, INDEX_FINGER_PIPE, INDEX_FINGER_TIP),
+            (MIDDLE_FINGER_BASE, MIDDLE_FINGER_PIPE, MIDDLE_FINGER_TIP),
+            (RING_FINGER_BASE, RING_FINGER_PIPE, RING_FINGER_TIP),
+            (PINKY_BASE, PINKY_PIPE, PINKY_TIP),
+        ];
+        for finger in 0..4 {
+            let (x, y) = bases[finger];
+            let (base, pipe, tip) = joints[finger];
+            landmarks[base] = Landmark { x, y, z: 0.0 };
+            landmarks[pipe] = Landmark { x, y: y - 10.0, z: 0.0 };
+            let tip_y = if straight[finger] { y - 50.0 } else { y - 2.0 };
+            landmarks[tip] = Landmark { x, y: tip_y, z: 0.0 };
+        }
+        Hand {
+            landmarks,
+            world_landmarks: [Landmark::default(); HAND_LANDMARK_COUNT],
+            handedness: Handedness::Right,
+            score: 1.0,
+            bbox: Rect::default(),
+        }
+    }
+
+    #[test]
+    fn a_pointing_posture_needs_the_index_out_and_the_other_three_curled() {
+        assert!(synthetic_hand(true, false, false, false).posture().pointing());
+        let two_out = synthetic_hand(true, true, false, false).posture();
+        assert!(!two_out.pointing() && !two_out.middle_folded, "middle finger reads as curled: {two_out:?}");
+        assert!(!synthetic_hand(false, false, false, false).posture().pointing());
+        assert!(!synthetic_hand(true, false, false, true).posture().pointing());
+    }
+
+    #[test]
+    fn pinch_distance_is_measured_in_frame_fractions() {
+        let mut hand = synthetic_hand(true, false, false, false);
+        hand.landmarks[THUMB_TIP] = Landmark { x: 100.0, y: 100.0, z: 0.0 };
+        hand.landmarks[INDEX_FINGER_TIP] = Landmark { x: 100.0, y: 100.0, z: 0.0 };
+        assert_eq!(hand.pinch_distance(320, 240), 0.0, "touching tips must read as zero");
+        hand.landmarks[INDEX_FINGER_TIP] = Landmark { x: 132.0, y: 100.0, z: 0.0 };
+        let pinch = hand.pinch_distance(320, 240);
+        assert!((pinch - 0.1).abs() < 1e-6, "32 px apart on a 320-wide frame = 0.1, got {pinch}");
     }
 
     #[test]

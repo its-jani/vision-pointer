@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+enigo = "0.6.1"
 image = "0.25.10"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
 ort = { version = "2.0.0-rc.15", features = ["download-binaries"] }
