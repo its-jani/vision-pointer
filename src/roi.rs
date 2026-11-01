@@ -28,7 +28,11 @@ impl Affine {
     };
 
     pub fn translation(dx: f64, dy: f64) -> Self {
-        Self { tx: dx, ty: dy, ..Self::IDENTITY }
+        Self {
+            tx: dx,
+            ty: dy,
+            ..Self::IDENTITY
+        }
     }
 
     /// Mirrors `cv2.getRotationMatrix2D(center, angle_degrees, 1.0)`.
@@ -240,7 +244,11 @@ impl Source<'_> {
         if width == 0 || height == 0 || pixels.len() != width * height * 3 {
             return None;
         }
-        Some(Source { pixels, width, height })
+        Some(Source {
+            pixels,
+            width,
+            height,
+        })
     }
 }
 
@@ -292,12 +300,7 @@ pub fn write_blob(
     }
 }
 
-fn sample_box(
-    source: Source<'_>,
-    mapping: &Affine,
-    out: (usize, usize),
-    dest: &mut [f32],
-) {
+fn sample_box(source: Source<'_>, mapping: &Affine, out: (usize, usize), dest: &mut [f32]) {
     let dst_x = out.0 as f64;
     let dst_y = out.1 as f64;
     let src_x0 = mapping.a * dst_x + mapping.tx;
@@ -362,7 +365,11 @@ fn sample_bilinear(source: Source<'_>, fx: f64, fy: f64, dest: &mut [f32]) {
             return None;
         }
         let index = (y as usize * source.width + x as usize) * 3;
-        Some([source.pixels[index], source.pixels[index + 1], source.pixels[index + 2]])
+        Some([
+            source.pixels[index],
+            source.pixels[index + 1],
+            source.pixels[index + 2],
+        ])
     };
 
     let p00 = pixel(x0, y0);

@@ -9,7 +9,7 @@
 //! `MOUSEEVENTF_ABSOLUTE`, which bypasses the "enhance pointer precision" acceleration curve that
 //! would otherwise make the mapping depend on how fast the hand moves.
 
-use crate::filter::EmaFilter2D;
+use crate::filter::{DEFAULT_BETA, DEFAULT_D_CUTOFF, OneEuroFilter2D};
 use anyhow::{Context, Result, anyhow, bail};
 use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub const CLICK_COOLDOWN: Duration = Duration::from_millis(300);
 /// Drives the real cursor.
 pub struct MouseController {
     enigo: Enigo,
-    filter: EmaFilter2D,
+    filter: OneEuroFilter2D,
     /// Main display size in pixels, asked of the OS at construction.
     display: (i32, i32),
     margin: f32,
@@ -81,18 +81,21 @@ fn map_point(
 impl MouseController {
     /// Connects to the display and asks it for its size.
     pub fn new() -> Result<MouseController> {
-        let enigo =
-            Enigo::new(&Settings::default()).context("Failed to connect to the display for input injection")?;
+        let enigo = Enigo::new(&Settings::default())
+            .context("Failed to connect to the display for input injection")?;
         let display = enigo
             .main_display()
             .map_err(|why| anyhow!("Failed to read the display size ({why})"))?;
         if display.0 <= 0 || display.1 <= 0 {
             bail!("the display reported an unusable size {display:?}");
         }
-        println!("Controlling the main display at {}x{}", display.0, display.1);
+        println!(
+            "Controlling the main display at {}x{}",
+            display.0, display.1
+        );
         Ok(MouseController {
             enigo,
-            filter: EmaFilter2D::new(),
+            filter: OneEuroFilter2D::new(),
             display,
             margin: ACTIVE_MARGIN,
             pinch_distance: PINCH_CLICK_DISTANCE,
@@ -104,9 +107,13 @@ impl MouseController {
         })
     }
 
-    /// Weight of the newest cursor sample; see [`EmaFilter2D`].
+    /// Maps the legacy 0-1 smoothing slider onto the 1-Euro filter's `min_cutoff`.
+    ///
+    /// alpha 0.25 (old EMA default) maps to 1.0 Hz, alpha 1.0 maps to 4.0 Hz (nearly
+    /// passthrough at 30 FPS), and alpha 0.0 maps to 0 Hz (maximum smoothing).
     pub fn with_alpha(mut self, alpha: f32) -> Self {
-        self.filter = EmaFilter2D::with_alpha(alpha);
+        let min_cutoff = alpha.clamp(0.0, 1.0) * 4.0;
+        self.filter = OneEuroFilter2D::with_parameters(min_cutoff, DEFAULT_BETA, DEFAULT_D_CUTOFF);
         self
     }
 
@@ -139,8 +146,8 @@ impl MouseController {
     /// rather than what was asked for.
     pub fn tuning(&self) -> String {
         format!(
-            "alpha {:.2} | inset {:.0}% each edge | pinch < {:.3}",
-            self.filter.alpha(),
+            "1-Euro min_cutoff {:.2} Hz | inset {:.0}% each edge | pinch < {:.3}",
+            self.filter.min_cutoff(),
             self.margin * 100.0,
             self.pinch_distance
         )
@@ -165,9 +172,16 @@ impl MouseController {
         if frame_w == 0 || frame_h == 0 {
             bail!("cannot map onto the display from a {frame_w}x{frame_h} frame");
         }
-        let (target_x, target_y) = map_point(raw_x, raw_y, (frame_w, frame_h), self.display, self.margin, self.mirror_x);
+        let (target_x, target_y) = map_point(
+            raw_x,
+            raw_y,
+            (frame_w, frame_h),
+            self.display,
+            self.margin,
+            self.mirror_x,
+        );
 
-        let (smoothed_x, smoothed_y) = self.filter.filter(target_x, target_y);
+        let (smoothed_x, smoothed_y) = self.filter.filter(target_x, target_y, Instant::now());
         let position = (smoothed_x.round() as i32, smoothed_y.round() as i32);
         self.last_position = Some(position);
 
@@ -234,36 +248,67 @@ mod tests {
     fn the_inset_edges_own_the_screen_corners() {
         // 15% of 320 is 48 px, 15% of 240 is 36 px: pointing there reaches the extreme pixel.
         let (x, y) = mapped(48.0, 36.0);
-        assert_eq!((x.round() as i32, y.round() as i32), (0, 0), "top-left: {x}, {y}");
+        assert_eq!(
+            (x.round() as i32, y.round() as i32),
+            (0, 0),
+            "top-left: {x}, {y}"
+        );
         let (x, y) = mapped(272.0, 204.0);
-        assert_eq!((x.round() as i32, y.round() as i32), (1919, 1079), "bottom-right: {x}, {y}");
+        assert_eq!(
+            (x.round() as i32, y.round() as i32),
+            (1919, 1079),
+            "bottom-right: {x}, {y}"
+        );
     }
 
     #[test]
     fn pointing_past_the_frame_edge_clamps_to_the_screen_edge() {
         let (x, y) = mapped(0.0, 0.0);
-        assert_eq!((x, y), (0.0, 0.0), "the frame corner must not overshoot the display");
+        assert_eq!(
+            (x, y),
+            (0.0, 0.0),
+            "the frame corner must not overshoot the display"
+        );
         let (x, y) = mapped(320.0, 240.0);
-        assert_eq!((x.round() as i32, y.round() as i32), (1919, 1079), "far corner: {x}, {y}");
+        assert_eq!(
+            (x.round() as i32, y.round() as i32),
+            (1919, 1079),
+            "far corner: {x}, {y}"
+        );
     }
 
     #[test]
     fn the_frame_centre_is_the_screen_centre() {
         let (x, y) = mapped(160.0, 120.0);
-        assert!((x - 959.5).abs() < 0.001 && (y - 539.5).abs() < 0.001, "centre = {x}, {y}");
+        assert!(
+            (x - 959.5).abs() < 0.001 && (y - 539.5).abs() < 0.001,
+            "centre = {x}, {y}"
+        );
     }
 
     #[test]
     fn mirroring_flips_only_the_horizontal_axis() {
         let left = map_point(48.0, 36.0, FRAME, DISPLAY, ACTIVE_MARGIN, true);
         let right = map_point(272.0, 36.0, FRAME, DISPLAY, ACTIVE_MARGIN, true);
-        assert_eq!((left.0.round() as i32, left.1.round() as i32), (1919, 0), "left edge of the frame -> right of the screen");
-        assert_eq!((right.0.round() as i32, right.1.round() as i32), (0, 0), "right edge -> left of the screen");
+        assert_eq!(
+            (left.0.round() as i32, left.1.round() as i32),
+            (1919, 0),
+            "left edge of the frame -> right of the screen"
+        );
+        assert_eq!(
+            (right.0.round() as i32, right.1.round() as i32),
+            (0, 0),
+            "right edge -> left of the screen"
+        );
     }
 
     #[test]
     fn a_zero_margin_maps_the_frame_onto_the_whole_screen() {
         let (x, y) = map_point(320.0, 240.0, FRAME, DISPLAY, 0.0, false);
-        assert_eq!((x.round() as i32, y.round() as i32), (1919, 1079), "no inset: {x}, {y}");
+        assert_eq!(
+            (x.round() as i32, y.round() as i32),
+            (1919, 1079),
+            "no inset: {x}, {y}"
+        );
     }
 }

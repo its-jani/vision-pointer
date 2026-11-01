@@ -129,10 +129,18 @@ struct Stage {
 }
 
 impl Stage {
-    fn open(environment: &Environment, spec: &model::ModelSpec, expected_size: usize) -> Result<(Stage, Vec<String>)> {
+    fn open(
+        environment: &Environment,
+        spec: &model::ModelSpec,
+        expected_size: usize,
+    ) -> Result<(Stage, Vec<String>)> {
         let session = model::open_session(environment, spec)?;
         let (size, layout) = inspect_input(&session, expected_size, spec.label)?;
-        let output_names: Vec<String> = session.outputs().iter().map(|outlet| outlet.name().to_string()).collect();
+        let output_names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|outlet| outlet.name().to_string())
+            .collect();
         println!(
             "{}: input {size}x{size} {:?}, {} output(s): {}",
             spec.label,
@@ -140,7 +148,15 @@ impl Stage {
             output_names.len(),
             output_names.join(", ")
         );
-        Ok((Stage { session, label: spec.label, size, layout }, output_names))
+        Ok((
+            Stage {
+                session,
+                label: spec.label,
+                size,
+                layout,
+            },
+            output_names,
+        ))
     }
 
     fn run<'a>(&'a mut self, blob: &[f32]) -> Result<SessionOutputs<'a>> {
@@ -156,13 +172,20 @@ impl Stage {
 /// Reads the graph's input metadata instead of trusting the documented shape: the conversion may
 /// expose `HWC` (as TFLite does) or `CHW`, and a quantised build can differ again.
 fn inspect_input(session: &Session, expected: usize, label: &str) -> Result<(usize, Layout)> {
-    let outlet = session.inputs().first().ok_or_else(|| anyhow!("the {label} model reports no inputs"))?;
+    let outlet = session
+        .inputs()
+        .first()
+        .ok_or_else(|| anyhow!("the {label} model reports no inputs"))?;
     let dims: Vec<i64> = match outlet.dtype() {
         ValueType::Tensor { shape, .. } => shape.iter().copied().collect(),
-        other => bail!("the {label} model input is not a tensor ({other:?}); run `cargo run --release -- describe`"),
+        other => bail!(
+            "the {label} model input is not a tensor ({other:?}); run `cargo run --release -- describe`"
+        ),
     };
     if dims.len() != 4 {
-        bail!("the {label} model input is not rank 4 ({dims:?}); run `cargo run --release -- describe`");
+        bail!(
+            "the {label} model input is not rank 4 ({dims:?}); run `cargo run --release -- describe`"
+        );
     }
     // Dynamic dimensions arrive as -1, so only the channel axis is dependable.
     let layout = if dims[1] == 3 {
@@ -179,14 +202,18 @@ fn inspect_input(session: &Session, expected: usize, label: &str) -> Result<(usi
     };
     let side = if height > 0 && width > 0 {
         if height != width {
-            bail!("the {label} model input is {width}x{height}, but the pipeline assumes a square input");
+            bail!(
+                "the {label} model input is {width}x{height}, but the pipeline assumes a square input"
+            );
         }
         height as usize
     } else {
         expected
     };
     if side != expected {
-        println!("Note: {label} model wants a {side}x{side} input (reference default was {expected}x{expected})");
+        println!(
+            "Note: {label} model wants a {side}x{side} input (reference default was {expected}x{expected})"
+        );
     }
     Ok((side, layout))
 }
@@ -196,7 +223,8 @@ fn make_input(blob: &[f32], size: usize, layout: Layout) -> Result<TensorRef<'_,
         Layout::Interleaved => ([1usize, size, size, 3], blob),
         Layout::Planar => ([1usize, 3, size, size], blob),
     };
-    TensorRef::from_array_view((shape, data)).context("Failed to wrap the input blob as a tensor view")
+    TensorRef::from_array_view((shape, data))
+        .context("Failed to wrap the input blob as a tensor view")
 }
 
 /// A palm detection in frame coordinates.
@@ -322,25 +350,45 @@ impl HandPipeline {
         let (frame_w, frame_h) = (frame.width, frame.height);
         let side = self.palm.size;
         let (mapping, pad_bias) = letterbox(frame_w, frame_h, side);
-        roi::write_blob(frame, &mapping, (side, side), self.palm.layout, &mut self.palm_blob);
+        roi::write_blob(
+            frame,
+            &mapping,
+            (side, side),
+            self.palm.layout,
+            &mut self.palm_blob,
+        );
 
         self.candidates.clear();
         self.order.clear();
         self.kept.clear();
 
         let outputs = self.palm.run(&self.palm_blob)?;
-        decode_palm_outputs(&outputs, &self.palm_outputs, side, (frame_w, frame_h), pad_bias, &mut self.candidates)?;
+        decode_palm_outputs(
+            &outputs,
+            &self.palm_outputs,
+            side,
+            (frame_w, frame_h),
+            pad_bias,
+            &mut self.candidates,
+        )?;
         drop(outputs);
 
         // Highest score first, greedy IoU suppression, then at most `max_hands` survivors.
         self.order.extend(0..self.candidates.len());
-        self.order.sort_by(|&a, &b| self.candidates[b].score.total_cmp(&self.candidates[a].score));
+        self.order.sort_by(|&a, &b| {
+            self.candidates[b]
+                .score
+                .total_cmp(&self.candidates[a].score)
+        });
         for &index in &self.order {
             if self.kept.len() >= PALM_TOP_K || self.kept.len() >= self.max_hands {
                 break;
             }
             let candidate = self.candidates[index];
-            let dominated = self.kept.iter().any(|kept| roi::iou(kept.bbox, candidate.bbox) >= PALM_NMS_IOU_THRESHOLD);
+            let dominated = self
+                .kept
+                .iter()
+                .any(|kept| roi::iou(kept.bbox, candidate.bbox) >= PALM_NMS_IOU_THRESHOLD);
             if !dominated {
                 self.kept.push(candidate);
             }
@@ -358,7 +406,13 @@ impl HandPipeline {
     /// Stage 2 for one palm: resample the upright crop, run the graph, de-rotate the keypoints.
     fn resolve_hand(&mut self, frame: roi::Source<'_>, plan: &HandPlan) -> Result<Option<Hand>> {
         let side = plan.side;
-        roi::write_blob(frame, &plan.mapping, (side, side), self.hand.layout, &mut self.hand_blob);
+        roi::write_blob(
+            frame,
+            &plan.mapping,
+            (side, side),
+            self.hand.layout,
+            &mut self.hand_blob,
+        );
 
         let outputs = self.hand.run(&self.hand_blob)?;
         decode_hand_outputs(&outputs, &self.hand_outputs, plan, self.hand_threshold)
@@ -403,7 +457,12 @@ fn decode_palm_outputs(
     for index in 0..names.len() {
         let (shape, data) = outputs[index]
             .try_extract_tensor::<f32>()
-            .with_context(|| format!("Failed to extract palm output #{} ({})", index, names[index]))?;
+            .with_context(|| {
+                format!(
+                    "Failed to extract palm output #{} ({})",
+                    index, names[index]
+                )
+            })?;
         let per_anchor = if data.len() % PALM_ANCHORS.len() == 0 {
             data.len() / PALM_ANCHORS.len()
         } else {
@@ -424,7 +483,12 @@ fn decode_palm_outputs(
             ),
         }
     }
-    let regressor = regressor.ok_or_else(|| anyhow!("the palm model exposes no {}-value regressor output", PALM_PREDICTOR_CHANNELS))?;
+    let regressor = regressor.ok_or_else(|| {
+        anyhow!(
+            "the palm model exposes no {}-value regressor output",
+            PALM_PREDICTOR_CHANNELS
+        )
+    })?;
     let scores = scores.ok_or_else(|| anyhow!("the palm model exposes no 1-value score output"))?;
 
     // `scale = max(original_shape)`; anchors are unit fractions of that scale.
@@ -443,7 +507,10 @@ fn decode_palm_outputs(
         let height = f64::from(regressor[base + 3]) * inv_size;
         let (anchor_x, anchor_y) = (f64::from(anchor[0]), f64::from(anchor[1]));
         let to_frame = |offset_x: f64, offset_y: f64| {
-            ((offset_x + anchor_x) * scale - pad_bias.0, (offset_y + anchor_y) * scale - pad_bias.1)
+            (
+                (offset_x + anchor_x) * scale - pad_bias.0,
+                (offset_y + anchor_y) * scale - pad_bias.1,
+            )
         };
         let (x0, y0) = to_frame(center_x - width / 2.0, center_y - height / 2.0);
         let (x1, y1) = to_frame(center_x + width / 2.0, center_y + height / 2.0);
@@ -485,8 +552,9 @@ fn plan_hand_roi(candidate: &Candidate, frame_w: usize, frame_h: usize, side: us
     let bias = (x0 - left, y0 - top);
     let box_p = Rect::new(left as f64, top as f64, crop_w as f64, crop_h as f64);
 
-    let landmarks_p: [(f64, f64); PALM_LANDMARK_COUNT] =
-        candidate.landmarks.map(|point| (point.0 - bias.0 as f64, point.1 - bias.1 as f64));
+    let landmarks_p: [(f64, f64); PALM_LANDMARK_COUNT] = candidate
+        .landmarks
+        .map(|point| (point.0 - bias.0 as f64, point.1 - bias.1 as f64));
     let angle = rotation_degrees(&landmarks_p);
     let rotation = Affine::rotation(box_p.center(), angle); // P -> R
     let inverse_rotation = rotation.invert_rigid(); // R -> P
@@ -497,7 +565,9 @@ fn plan_hand_roi(candidate: &Candidate, frame_w: usize, frame_h: usize, side: us
     }
     let rotated_box = roi::bounding_box(&rotated).unwrap_or(box_p);
 
-    let grown2 = rotated_box.shifted(PALM_BOX_SHIFT).enlarged_uniform(PALM_BOX_ENLARGE);
+    let grown2 = rotated_box
+        .shifted(PALM_BOX_SHIFT)
+        .enlarged_uniform(PALM_BOX_ENLARGE);
     let (bx0, by0, bx1, by1) = quantize(&grown2, square, square);
     let crop2_w = (bx1 - bx0).max(1);
     let crop2_h = (by1 - by0).max(1);
@@ -507,7 +577,12 @@ fn plan_hand_roi(candidate: &Candidate, frame_w: usize, frame_h: usize, side: us
     // Origin of the stage-2 crop (space R) inside R.
     let bias2 = (bx0 - left2, by0 - top2);
 
-    let square_r = Rect::new(bias2.0 as f64, bias2.1 as f64, square2 as f64, square2 as f64);
+    let square_r = Rect::new(
+        bias2.0 as f64,
+        bias2.1 as f64,
+        square2 as f64,
+        square2 as f64,
+    );
     let box2_r = Rect::new(bx0 as f64, by0 as f64, crop2_w as f64, crop2_h as f64);
     let to_frame = Affine::translation(bias.0 as f64, bias.1 as f64);
     let mapping = square_r
@@ -595,7 +670,11 @@ fn classify(name: &str, values: usize, taken: Taken) -> Slot {
         return Slot::Handedness;
     }
     if lowered.contains("landmark") {
-        return if taken.landmarks { Slot::World } else { Slot::Landmarks };
+        return if taken.landmarks {
+            Slot::World
+        } else {
+            Slot::Landmarks
+        };
     }
     if lowered.contains("confidence") || lowered.contains("presence") || lowered.contains("score") {
         return Slot::Confidence;
@@ -626,7 +705,12 @@ fn classify(name: &str, values: usize, taken: Taken) -> Slot {
 }
 
 /// Runs the landmark graph for one palm crop and maps its keypoints back to frame pixels.
-fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPlan, threshold: f64) -> Result<Option<Hand>> {
+fn decode_hand_outputs(
+    outputs: &SessionOutputs,
+    names: &[String],
+    plan: &HandPlan,
+    threshold: f64,
+) -> Result<Option<Hand>> {
     let mut screen: Option<&[f32]> = None;
     let mut world: Option<&[f32]> = None;
     let mut confidence: Option<&[f32]> = None;
@@ -635,20 +719,34 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
     for index in 0..names.len() {
         let (shape, data) = outputs[index]
             .try_extract_tensor::<f32>()
-            .with_context(|| format!("Failed to extract hand output #{} ({})", index, names[index]))?;
+            .with_context(|| {
+                format!(
+                    "Failed to extract hand output #{} ({})",
+                    index, names[index]
+                )
+            })?;
         let slot = classify(&names[index], data.len(), taken);
         match slot {
             Slot::Landmarks => screen = Some(data),
             Slot::World => world = Some(data),
             Slot::Confidence => confidence = Some(data),
             Slot::Handedness => handedness = Some(data),
-            Slot::Unknown => println!("Note: unrecognised hand output {} with shape {shape}", names[index]),
+            Slot::Unknown => println!(
+                "Note: unrecognised hand output {} with shape {shape}",
+                names[index]
+            ),
         }
         taken.mark(slot);
     }
 
-    let confidence = confidence.ok_or_else(|| anyhow!("the hand model exposes no confidence/presence output"))?;
-    let screen = screen.ok_or_else(|| anyhow!("the hand model exposes no {}-value landmark output", HAND_LANDMARK_COUNT * 3))?;
+    let confidence = confidence
+        .ok_or_else(|| anyhow!("the hand model exposes no confidence/presence output"))?;
+    let screen = screen.ok_or_else(|| {
+        anyhow!(
+            "the hand model exposes no {}-value landmark output",
+            HAND_LANDMARK_COUNT * 3
+        )
+    })?;
     let score = f64::from(confidence[0]);
     if score < threshold {
         return Ok(None);
@@ -702,7 +800,11 @@ fn decode_hand_outputs(outputs: &SessionOutputs, names: &[String], plan: &HandPl
     Ok(Some(Hand {
         landmarks,
         world_landmarks,
-        handedness: if handedness_score > 0.5 { Handedness::Right } else { Handedness::Left },
+        handedness: if handedness_score > 0.5 {
+            Handedness::Right
+        } else {
+            Handedness::Left
+        },
         score,
         bbox,
     }))
@@ -753,8 +855,16 @@ impl Hand {
     /// Which fingers are straight and which are curled.
     pub fn posture(&self) -> Posture {
         Posture {
-            index_extended: self.finger_extended(INDEX_FINGER_BASE, INDEX_FINGER_PIPE, INDEX_FINGER_TIP),
-            middle_folded: self.finger_folded(MIDDLE_FINGER_BASE, MIDDLE_FINGER_PIPE, MIDDLE_FINGER_TIP),
+            index_extended: self.finger_extended(
+                INDEX_FINGER_BASE,
+                INDEX_FINGER_PIPE,
+                INDEX_FINGER_TIP,
+            ),
+            middle_folded: self.finger_folded(
+                MIDDLE_FINGER_BASE,
+                MIDDLE_FINGER_PIPE,
+                MIDDLE_FINGER_TIP,
+            ),
             ring_folded: self.finger_folded(RING_FINGER_BASE, RING_FINGER_PIPE, RING_FINGER_TIP),
             pinky_folded: self.finger_folded(PINKY_BASE, PINKY_PIPE, PINKY_TIP),
         }
@@ -801,9 +911,17 @@ mod tests {
     fn a_wide_frame_is_letterboxed_into_the_model_square() {
         let (mapping, pad_bias) = letterbox(320, 240, 192);
         // ratio = min(192/240, 192/320) = 0.6 -> 192x144 centred in 192 rows.
-        assert!((mapping.a - 1.0 / 0.6).abs() < 1e-9, "scale = {}", mapping.a);
+        assert!(
+            (mapping.a - 1.0 / 0.6).abs() < 1e-9,
+            "scale = {}",
+            mapping.a
+        );
         assert!(pad_bias.0.abs() < 0.5, "horizontal pad = {}", pad_bias.0);
-        assert!((pad_bias.1 - 40.0).abs() < 0.5, "vertical pad = {}", pad_bias.1);
+        assert!(
+            (pad_bias.1 - 40.0).abs() < 0.5,
+            "vertical pad = {}",
+            pad_bias.1
+        );
     }
 
     #[test]
@@ -811,7 +929,11 @@ mod tests {
         let mut landmarks = [(0.0, 0.0); PALM_LANDMARK_COUNT];
         landmarks[INDEX_OF_PALM_BASE] = (50.0, 200.0);
         landmarks[INDEX_OF_MIDDLE_FINGER_BASE] = (50.0, 80.0);
-        assert!(rotation_degrees(&landmarks).abs() < 1e-9, "angle = {}", rotation_degrees(&landmarks));
+        assert!(
+            rotation_degrees(&landmarks).abs() < 1e-9,
+            "angle = {}",
+            rotation_degrees(&landmarks)
+        );
     }
 
     #[test]
@@ -819,7 +941,11 @@ mod tests {
         let mut landmarks = [(0.0, 0.0); PALM_LANDMARK_COUNT];
         landmarks[INDEX_OF_PALM_BASE] = (0.0, 0.0);
         landmarks[INDEX_OF_MIDDLE_FINGER_BASE] = (100.0, 0.0);
-        assert!((rotation_degrees(&landmarks) - 90.0).abs() < 1e-9, "angle = {}", rotation_degrees(&landmarks));
+        assert!(
+            (rotation_degrees(&landmarks) - 90.0).abs() < 1e-9,
+            "angle = {}",
+            rotation_degrees(&landmarks)
+        );
     }
 
     #[test]
@@ -848,14 +974,24 @@ mod tests {
             centre.0 > 0.0 && centre.0 < 320.0 && centre.1 > 0.0 && centre.1 < 240.0,
             "centre = {centre:?}"
         );
-        assert!(plan.pixel_scale > 0.0 && plan.pixel_scale < 10.0, "scale = {}", plan.pixel_scale);
+        assert!(
+            plan.pixel_scale > 0.0 && plan.pixel_scale < 10.0,
+            "scale = {}",
+            plan.pixel_scale
+        );
     }
 
     #[test]
     fn hand_outputs_are_matched_by_name_then_by_size() {
         let empty = Taken::default();
-        let with_landmarks = Taken { landmarks: true, ..empty };
-        let with_confidence = Taken { confidence: true, ..empty };
+        let with_landmarks = Taken {
+            landmarks: true,
+            ..empty
+        };
+        let with_confidence = Taken {
+            confidence: true,
+            ..empty
+        };
         assert_eq!(classify("world_landmarks", 63, empty), Slot::World);
         assert_eq!(classify("handedness", 1, empty), Slot::Handedness);
         assert_eq!(classify("Identity", 63, empty), Slot::Landmarks);
@@ -871,7 +1007,12 @@ mod tests {
         // The names `cargo run --release -- describe` prints for the downloaded assets, in order:
         // landmarks, confidence, handedness, world landmarks. Both scalars are 1 element, so this
         // is the regression test for telling them apart.
-        let contract = [("Identity", 63usize), ("Identity_1", 1), ("Identity_2", 1), ("Identity_3", 63)];
+        let contract = [
+            ("Identity", 63usize),
+            ("Identity_1", 1),
+            ("Identity_2", 1),
+            ("Identity_3", 63),
+        ];
         let mut taken = Taken::default();
         let mut slots = Vec::new();
         for (name, values) in contract {
@@ -879,7 +1020,15 @@ mod tests {
             slots.push(slot);
             taken.mark(slot);
         }
-        assert_eq!(slots, vec![Slot::Landmarks, Slot::Confidence, Slot::Handedness, Slot::World]);
+        assert_eq!(
+            slots,
+            vec![
+                Slot::Landmarks,
+                Slot::Confidence,
+                Slot::Handedness,
+                Slot::World
+            ]
+        );
     }
 
     /// A hand whose fingers are straight (`true`) or curled (`false`), with the segment ratios
@@ -887,9 +1036,22 @@ mod tests {
     /// when curled.
     fn synthetic_hand(index: bool, middle: bool, ring: bool, pinky: bool) -> Hand {
         let mut landmarks = [Landmark::default(); HAND_LANDMARK_COUNT];
-        landmarks[0] = Landmark { x: 160.0, y: 200.0, z: 0.0 }; // wrist
-        landmarks[THUMB_TIP] = Landmark { x: 140.0, y: 190.0, z: 0.0 };
-        let bases: [(f64, f64); 4] = [(150.0, 150.0), (165.0, 150.0), (180.0, 152.0), (195.0, 155.0)];
+        landmarks[0] = Landmark {
+            x: 160.0,
+            y: 200.0,
+            z: 0.0,
+        }; // wrist
+        landmarks[THUMB_TIP] = Landmark {
+            x: 140.0,
+            y: 190.0,
+            z: 0.0,
+        };
+        let bases: [(f64, f64); 4] = [
+            (150.0, 150.0),
+            (165.0, 150.0),
+            (180.0, 152.0),
+            (195.0, 155.0),
+        ];
         let straight = [index, middle, ring, pinky];
         let joints: [(usize, usize, usize); 4] = [
             (INDEX_FINGER_BASE, INDEX_FINGER_PIPE, INDEX_FINGER_TIP),
@@ -901,9 +1063,17 @@ mod tests {
             let (x, y) = bases[finger];
             let (base, pipe, tip) = joints[finger];
             landmarks[base] = Landmark { x, y, z: 0.0 };
-            landmarks[pipe] = Landmark { x, y: y - 10.0, z: 0.0 };
+            landmarks[pipe] = Landmark {
+                x,
+                y: y - 10.0,
+                z: 0.0,
+            };
             let tip_y = if straight[finger] { y - 50.0 } else { y - 2.0 };
-            landmarks[tip] = Landmark { x, y: tip_y, z: 0.0 };
+            landmarks[tip] = Landmark {
+                x,
+                y: tip_y,
+                z: 0.0,
+            };
         }
         Hand {
             landmarks,
@@ -916,22 +1086,56 @@ mod tests {
 
     #[test]
     fn a_pointing_posture_needs_the_index_out_and_the_other_three_curled() {
-        assert!(synthetic_hand(true, false, false, false).posture().pointing());
+        assert!(
+            synthetic_hand(true, false, false, false)
+                .posture()
+                .pointing()
+        );
         let two_out = synthetic_hand(true, true, false, false).posture();
-        assert!(!two_out.pointing() && !two_out.middle_folded, "middle finger reads as curled: {two_out:?}");
-        assert!(!synthetic_hand(false, false, false, false).posture().pointing());
-        assert!(!synthetic_hand(true, false, false, true).posture().pointing());
+        assert!(
+            !two_out.pointing() && !two_out.middle_folded,
+            "middle finger reads as curled: {two_out:?}"
+        );
+        assert!(
+            !synthetic_hand(false, false, false, false)
+                .posture()
+                .pointing()
+        );
+        assert!(
+            !synthetic_hand(true, false, false, true)
+                .posture()
+                .pointing()
+        );
     }
 
     #[test]
     fn pinch_distance_is_measured_in_frame_fractions() {
         let mut hand = synthetic_hand(true, false, false, false);
-        hand.landmarks[THUMB_TIP] = Landmark { x: 100.0, y: 100.0, z: 0.0 };
-        hand.landmarks[INDEX_FINGER_TIP] = Landmark { x: 100.0, y: 100.0, z: 0.0 };
-        assert_eq!(hand.pinch_distance(320, 240), 0.0, "touching tips must read as zero");
-        hand.landmarks[INDEX_FINGER_TIP] = Landmark { x: 132.0, y: 100.0, z: 0.0 };
+        hand.landmarks[THUMB_TIP] = Landmark {
+            x: 100.0,
+            y: 100.0,
+            z: 0.0,
+        };
+        hand.landmarks[INDEX_FINGER_TIP] = Landmark {
+            x: 100.0,
+            y: 100.0,
+            z: 0.0,
+        };
+        assert_eq!(
+            hand.pinch_distance(320, 240),
+            0.0,
+            "touching tips must read as zero"
+        );
+        hand.landmarks[INDEX_FINGER_TIP] = Landmark {
+            x: 132.0,
+            y: 100.0,
+            z: 0.0,
+        };
         let pinch = hand.pinch_distance(320, 240);
-        assert!((pinch - 0.1).abs() < 1e-6, "32 px apart on a 320-wide frame = 0.1, got {pinch}");
+        assert!(
+            (pinch - 0.1).abs() < 1e-6,
+            "32 px apart on a 320-wide frame = 0.1, got {pinch}"
+        );
     }
 
     #[test]

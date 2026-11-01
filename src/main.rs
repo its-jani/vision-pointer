@@ -11,7 +11,7 @@ use camera::CameraCapture;
 use controller::MouseController;
 use hands::{Hand, HandPipeline, Posture, Timings};
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Resolution the vision models run at; the camera downsamples its native stream into this.
 const PROCESS_WIDTH: u32 = 320;
@@ -22,6 +22,11 @@ const TARGET_FPS: u32 = 30;
 const BENCH_FRAMES: u32 = 150;
 /// Frames averaged into the live FPS readout.
 const FPS_WINDOW: u32 = 30;
+/// Seconds without a detected hand before the pipeline enters idle mode.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Sleep between processed frames in idle mode, capping inference throughput to ~10 FPS.
+/// The camera pump still delivers frames; only the consumer slows down.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct Flags {
@@ -59,8 +64,14 @@ impl Default for Flags {
 impl Flags {
     fn parse(args: &[String]) -> Result<Flags> {
         let mut rest = args.to_vec();
-        let mut flags = if rest.first().is_some_and(|argument| !argument.starts_with('-')) {
-            Flags { command: rest.remove(0), ..Flags::default() }
+        let mut flags = if rest
+            .first()
+            .is_some_and(|argument| !argument.starts_with('-'))
+        {
+            Flags {
+                command: rest.remove(0),
+                ..Flags::default()
+            }
         } else {
             Flags::default()
         };
@@ -73,7 +84,9 @@ impl Flags {
                 "--camera" => flags.camera = number(flag, value(&mut index, &rest, flag)?)?,
                 "--frames" => flags.frames = number(flag, value(&mut index, &rest, flag)?)?,
                 "--max-hands" => flags.max_hands = number(flag, value(&mut index, &rest, flag)?)?,
-                "--min-confidence" => flags.min_confidence = number(flag, value(&mut index, &rest, flag)?)?,
+                "--min-confidence" => {
+                    flags.min_confidence = number(flag, value(&mut index, &rest, flag)?)?
+                }
                 "--alpha" => flags.alpha = number(flag, value(&mut index, &rest, flag)?)?,
                 "--margin" => flags.margin = number(flag, value(&mut index, &rest, flag)?)?,
                 "--pinch" => flags.pinch = number(flag, value(&mut index, &rest, flag)?)?,
@@ -102,8 +115,7 @@ fn number<T: std::str::FromStr>(flag: &str, text: String) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
-    text
-        .parse::<T>()
+    text.parse::<T>()
         .map_err(|why| anyhow::anyhow!("`{flag}` expects a number, got `{text}` ({why})"))
 }
 
@@ -176,7 +188,11 @@ fn open_camera(flags: &Flags, header: &str) -> Result<CameraCapture> {
     );
     println!(
         " - Frame Delivery: {}",
-        if stream.pumped { "threaded pump (non-blocking capture loop)" } else { "blocking grab on caller thread" }
+        if stream.pumped {
+            "threaded pump (non-blocking capture loop)"
+        } else {
+            "blocking grab on caller thread"
+        }
     );
     println!(
         " - Target Processing Buffer: {}x{} RGB ({} bytes/frame)",
@@ -191,7 +207,9 @@ fn open_camera(flags: &Flags, header: &str) -> Result<CameraCapture> {
 fn bench(flags: &Flags) -> Result<()> {
     let mut camera = open_camera(flags, "Gesture Daemon - Phase 1: Camera Capture Benchmark")?;
 
-    println!("\nCapturing {BENCH_FRAMES} frames to measure zero-copy buffer & FPS performance...\n");
+    println!(
+        "\nCapturing {BENCH_FRAMES} frames to measure zero-copy buffer & FPS performance...\n"
+    );
 
     let started = Instant::now();
     let mut window = Instant::now();
@@ -246,10 +264,7 @@ fn hands(flags: &Flags) -> Result<()> {
     let (width, height) = camera.resolution();
     println!(
         "\nLandmark pipeline ready (max {} hand(s), min confidence {:.2}, processing {}x{}). Ctrl-C stops.\n",
-        flags.max_hands,
-        flags.min_confidence,
-        width,
-        height
+        flags.max_hands, flags.min_confidence, width, height
     );
 
     let started = Instant::now();
@@ -258,6 +273,11 @@ fn hands(flags: &Flags) -> Result<()> {
     let mut captured = 0u32;
     let mut detected = 0u32;
     let mut detect_ms = 0.0f64;
+
+    // Idle power-saving state machine.
+    let mut last_hand_seen = Instant::now();
+    let mut idle = false;
+
     loop {
         if flags.frames > 0 && captured >= flags.frames {
             break;
@@ -270,7 +290,23 @@ fn hands(flags: &Flags) -> Result<()> {
         frames_in_window += 1;
         detect_ms += elapsed;
 
-        let hands = result.map_err(|why| anyhow::anyhow!("frame {captured}: landmark pipeline failed: {why}"))?;
+        let hands = result
+            .map_err(|why| anyhow::anyhow!("frame {captured}: landmark pipeline failed: {why}"))?;
+        if hands.is_empty() {
+            if last_hand_seen.elapsed() > IDLE_TIMEOUT && !idle {
+                idle = true;
+                println!(
+                    "[idle] no hand for {:.1}s - throttling to ~10 FPS",
+                    IDLE_TIMEOUT.as_secs_f64()
+                );
+            }
+        } else {
+            if idle {
+                idle = false;
+                println!("[active] hand detected - resuming full rate");
+            }
+            last_hand_seen = Instant::now();
+        }
         detected = detected.max(hands.len() as u32);
         let fps = frames_in_window as f64 / window.elapsed().as_secs_f64();
         // Every frame with a hand, plus a heartbeat so a still camera does not look frozen.
@@ -281,13 +317,22 @@ fn hands(flags: &Flags) -> Result<()> {
             window = Instant::now();
             frames_in_window = 0;
         }
+        if idle {
+            std::thread::sleep(IDLE_POLL_INTERVAL);
+        }
     }
 
     let elapsed = started.elapsed().as_secs_f64();
     println!("\n------------------------------------------------------------");
     println!("Frames processed:      {captured}");
-    println!("Framerate:             {:.1} FPS", captured as f64 / elapsed);
-    println!("Average inference:     {:.1} ms/frame", detect_ms / captured.max(1) as f64);
+    println!(
+        "Framerate:             {:.1} FPS",
+        captured as f64 / elapsed
+    );
+    println!(
+        "Average inference:     {:.1} ms/frame",
+        detect_ms / captured.max(1) as f64
+    );
     println!("Hands seen in a frame: {detected}");
     println!("------------------------------------------------------------");
     Ok(())
@@ -312,7 +357,11 @@ fn run(flags: &Flags) -> Result<()> {
     println!(
         "\nPointer ready: frame {width}x{height} on a {display_w}x{display_h} display | {}{}\nCtrl-C stops.\n",
         pointer.tuning(),
-        if flags.dry_run { " | dry run: the real cursor stays put" } else { "" }
+        if flags.dry_run {
+            " | dry run: the real cursor stays put"
+        } else {
+            ""
+        }
     );
 
     let started = Instant::now();
@@ -321,6 +370,11 @@ fn run(flags: &Flags) -> Result<()> {
     let mut captured = 0u32;
     let mut pointing_frames = 0u32;
     let mut clicks = 0u32;
+
+    // --- Adaptive power-saving state machine ---
+    let mut last_hand_seen = Instant::now();
+    let mut idle = false;
+
     loop {
         if flags.frames > 0 && captured >= flags.frames {
             break;
@@ -338,8 +392,14 @@ fn run(flags: &Flags) -> Result<()> {
         let pilot = hands.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let report = match pilot {
             None => {
-                // Tracking dropped out: forget the smoothing history, so a hand that reappears
-                // across the frame does not drag the cursor along an exponential path to it.
+                // Check idle transition: no hand present, see if we should throttle.
+                if last_hand_seen.elapsed() > IDLE_TIMEOUT && !idle {
+                    idle = true;
+                    println!(
+                        "[idle] no hand for {:.1}s - throttling to ~10 FPS",
+                        IDLE_TIMEOUT.as_secs_f64()
+                    );
+                }
                 pointer.reset();
                 PointerReport {
                     frame: captured,
@@ -355,6 +415,15 @@ fn run(flags: &Flags) -> Result<()> {
                 }
             }
             Some(hand) => {
+                // Hand detected: exit idle immediately and reset the timer.
+                if idle {
+                    idle = false;
+                    println!(
+                        "[active] hand detected (conf {:.2}) - resuming 30 FPS",
+                        hand.score
+                    );
+                }
+                last_hand_seen = Instant::now();
                 let pinch = hand.pinch_distance(width, height);
                 // A pinch curls the index finger, so it is scored on every tracked frame rather
                 // than only while pointing.
@@ -392,6 +461,10 @@ fn run(flags: &Flags) -> Result<()> {
             window = Instant::now();
             frames_in_window = 0;
         }
+        // Idle mode: sleep between polls to reduce CPU from 30 to ~10 FPS.
+        if idle {
+            std::thread::sleep(IDLE_POLL_INTERVAL);
+        }
     }
 
     let elapsed = started.elapsed().as_secs_f64();
@@ -399,7 +472,10 @@ fn run(flags: &Flags) -> Result<()> {
     println!("Frames processed:   {captured}");
     println!("Framerate:          {:.1} FPS", captured as f64 / elapsed);
     println!("Pointing frames:    {pointing_frames}");
-    println!("Clicks injected:    {clicks}{}", if flags.dry_run { " (dry run)" } else { "" });
+    println!(
+        "Clicks injected:    {clicks}{}",
+        if flags.dry_run { " (dry run)" } else { "" }
+    );
     println!("------------------------------------------------------------");
     Ok(())
 }
@@ -427,7 +503,11 @@ fn pointer_readout(report: &PointerReport) {
     match (report.hand, report.pointing) {
         (Some(hand), true) => {
             let (x, y) = report.position.unwrap_or((0, 0));
-            let _ = write!(line, "Pointing: Active | Smoothed ({x}, {y}) | Pinch {:.3}", report.pinch);
+            let _ = write!(
+                line,
+                "Pointing: Active | Smoothed ({x}, {y}) | Pinch {:.3}",
+                report.pinch
+            );
             if report.clicked {
                 line.push_str(" | Click");
             }
@@ -444,14 +524,24 @@ fn pointer_readout(report: &PointerReport) {
         }
         // Tracked but not aimed: the posture explains why the cursor is holding still.
         (Some(hand), false) => {
-            let _ = write!(line, "Pointing: {} | Pinch {:.3} | conf {:.2}", report.posture.label(), report.pinch, hand.score);
+            let _ = write!(
+                line,
+                "Pointing: {} | Pinch {:.3} | conf {:.2}",
+                report.posture.label(),
+                report.pinch,
+                hand.score
+            );
             if let Some((x, y)) = report.position {
                 let _ = write!(line, " | cursor holding at ({x}, {y})");
             }
             let _ = write!(line, " | {:.1} FPS", report.fps);
         }
         (None, _) => {
-            let _ = write!(line, "Pointing: Lost | no hand tracked | {:.1} FPS", report.fps);
+            let _ = write!(
+                line,
+                "Pointing: Lost | no hand tracked | {:.1} FPS",
+                report.fps
+            );
         }
     }
     println!("{}", line.trim_end());
@@ -498,7 +588,10 @@ fn fetch_models(flags: &Flags) -> Result<()> {
     }
     let fetched = model::fetch_models(flags.force)?;
     if fetched == 0 {
-        println!("Nothing to do - both models are already in {}.", dir.display());
+        println!(
+            "Nothing to do - both models are already in {}.",
+            dir.display()
+        );
     } else {
         println!("\nDownloaded {fetched} model(s) into {}.", dir.display());
         println!("Check the tensor contract next:\n  cargo run --release -- describe");

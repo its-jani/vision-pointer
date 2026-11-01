@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: exe
+            archive: zip
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ''
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-target-release-${{ matrix.target }}-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          $staging = "release-pkg"
+          New-Item -ItemType Directory -Force -Path $staging
+          Copy-Item $binary $staging/
+          Copy-Item README.md $staging/
+          Compress-Archive -Path "$staging/*" -DestinationPath "vision-pointer-${{ matrix.target }}.zip"
+
+      - name: Package archive (Linux)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          BINARY="target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          STAGING="release-pkg"
+          mkdir -p "$STAGING"
+          cp "$BINARY" "$STAGING/"
+          cp README.md "$STAGING/"
+          tar -czf "vision-pointer-${{ matrix.target }}.tar.gz" -C "$STAGING" .
+          rm -rf "$STAGING"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vision-pointer-${{ matrix.target }}
+          path: vision-pointer-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/vision-pointer-*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

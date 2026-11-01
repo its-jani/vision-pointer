@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
-use nokhwa::Camera;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -58,7 +58,9 @@ impl Pump {
     fn lock_slot(&self) -> std::sync::MutexGuard<'_, FrameSlot> {
         // A panic while holding this lock would only corrupt frame data, so keep serving
         // frames instead of poisoning the whole capture pipeline.
-        self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -115,7 +117,9 @@ impl CameraCapture {
         match Self::new_pumped(index, chosen, target_width, target_height) {
             Ok(capture) => Ok(capture),
             Err(why) => {
-                eprintln!("Warning: threaded frame pump unavailable ({why}), falling back to blocking capture...");
+                eprintln!(
+                    "Warning: threaded frame pump unavailable ({why}), falling back to blocking capture..."
+                );
                 Self::new_direct(index, chosen, target_width, target_height)
             }
         }
@@ -144,7 +148,14 @@ impl CameraCapture {
         let thread_stop = stop.clone();
         let thread_pump = pump.clone();
         let handle = std::thread::spawn(move || {
-            run_frame_pump(index, chosen, target_width, target_height, thread_pump, thread_stop);
+            run_frame_pump(
+                index,
+                chosen,
+                target_width,
+                target_height,
+                thread_pump,
+                thread_stop,
+            );
         });
 
         // Block until the pump proves it can open the device; if it cannot, tear it down and
@@ -259,7 +270,9 @@ fn await_pumped_frame(pump: &Pump, seen_sequence: &mut u64, out: &mut [u8]) -> R
             return Err(anyhow!("Capture thread lost the stream: {error}"));
         }
         let Some(rest) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(anyhow!("Timed out waiting for a frame from the capture thread"));
+            return Err(anyhow!(
+                "Timed out waiting for a frame from the capture thread"
+            ));
         };
         let (next_slot, wait_result) = pump
             .frame_ready
@@ -267,7 +280,9 @@ fn await_pumped_frame(pump: &Pump, seen_sequence: &mut u64, out: &mut [u8]) -> R
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         slot = next_slot;
         if wait_result.timed_out() {
-            return Err(anyhow!("Timed out waiting for a frame from the capture thread"));
+            return Err(anyhow!(
+                "Timed out waiting for a frame from the capture thread"
+            ));
         }
     }
 
@@ -464,7 +479,10 @@ fn negotiate_capture_format(index: u32, target_fps: u32) -> Result<Option<Camera
     };
 
     if !formats.is_empty() {
-        println!("Camera advertises {} format(s), sampling the low-resolution tiers:", formats.len());
+        println!(
+            "Camera advertises {} format(s), sampling the low-resolution tiers:",
+            formats.len()
+        );
         for fmt in formats
             .iter()
             .filter(|fmt| fmt.resolution().width() <= NATIVE_MAX_WIDTH)
@@ -487,14 +505,16 @@ fn select_capture_format(formats: &[CameraFormat], target_fps: u32) -> Option<Ca
     formats
         .iter()
         // Only formats nokhwa can hand straight back as RGB888 (GRAY is dropped on purpose).
-        .filter(|fmt| matches!(
-            fmt.format(),
-            FrameFormat::MJPEG
-                | FrameFormat::YUYV
-                | FrameFormat::NV12
-                | FrameFormat::RAWRGB
-                | FrameFormat::RAWBGR
-        ))
+        .filter(|fmt| {
+            matches!(
+                fmt.format(),
+                FrameFormat::MJPEG
+                    | FrameFormat::YUYV
+                    | FrameFormat::NV12
+                    | FrameFormat::RAWRGB
+                    | FrameFormat::RAWBGR
+            )
+        })
         .filter(|fmt| fmt.frame_rate() >= MIN_ACCEPTABLE_FPS)
         .max_by_key(|fmt| format_score(fmt, target_fps))
         .copied()
