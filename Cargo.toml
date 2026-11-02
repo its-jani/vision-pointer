@@ -1,5 +1,5 @@
 [package]
-name = "gesture-daemon"
+name = "vision-pointer"
 version = "0.1.0"
 edition = "2024"
 

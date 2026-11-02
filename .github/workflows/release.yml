@@ -56,7 +56,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $binary = "target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          $binary = "target/${{ matrix.target }}/release/vision-pointer${{ matrix.ext }}"
           if (-not (Test-Path -LiteralPath $binary)) {
               Write-Host "::error::Expected binary not found at '$binary'"
               Get-ChildItem "target/${{ matrix.target }}/release/" | ForEach-Object { Write-Host $_.Name }
@@ -72,7 +72,7 @@ jobs:
       - name: Package archive (Linux)
         if: matrix.archive == 'tar.gz'
         run: |
-          BINARY="target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          BINARY="target/${{ matrix.target }}/release/vision-pointer${{ matrix.ext }}"
           if [ ! -f "$BINARY" ]; then
               echo "::error::Expected binary not found at '$BINARY'"
               ls -1 "target/${{ matrix.target }}/release/"

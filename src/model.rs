@@ -160,7 +160,7 @@ fn transfer(url: &str, dest: &Path) -> Result<u64> {
 /// Opens an ORT environment. Exactly one may exist per process, so callers create this once.
 pub fn init_environment() -> Result<Environment> {
     ort::init()
-        .with_name("gesture-daemon")
+        .with_name("vision-pointer")
         .build()
         .context("Failed to initialise ONNX Runtime")
 }
