@@ -18,7 +18,7 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            ext: exe
+            ext: .exe
             archive: zip
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -57,16 +57,27 @@ jobs:
         shell: pwsh
         run: |
           $binary = "target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          if (-not (Test-Path -LiteralPath $binary)) {
+              Write-Host "::error::Expected binary not found at '$binary'"
+              Get-ChildItem "target/${{ matrix.target }}/release/" | ForEach-Object { Write-Host $_.Name }
+              exit 1
+          }
           $staging = "release-pkg"
-          New-Item -ItemType Directory -Force -Path $staging
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item $binary $staging/
           Copy-Item README.md $staging/
           Compress-Archive -Path "$staging/*" -DestinationPath "vision-pointer-${{ matrix.target }}.zip"
+          Remove-Item -Recurse -Force $staging
 
       - name: Package archive (Linux)
         if: matrix.archive == 'tar.gz'
         run: |
           BINARY="target/${{ matrix.target }}/release/gesture-daemon${{ matrix.ext }}"
+          if [ ! -f "$BINARY" ]; then
+              echo "::error::Expected binary not found at '$BINARY'"
+              ls -1 "target/${{ matrix.target }}/release/"
+              exit 1
+          fi
           STAGING="release-pkg"
           mkdir -p "$STAGING"
           cp "$BINARY" "$STAGING/"
