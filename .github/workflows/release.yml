@@ -49,6 +49,24 @@ jobs:
           key: ${{ runner.os }}-target-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-target-release-${{ matrix.target }}-
 
+      # Keep in sync with .github/workflows/ci.yml: nokhwa/v4l2 needs the V4L
+      # headers, v4l2-sys-mit runs bindgen (libclang), enigo needs xkbcommon,
+      # and ureq's native-tls needs OpenSSL.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            clang \
+            libclang-dev \
+            libssl-dev \
+            libv4l-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 

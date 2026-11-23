@@ -11,10 +11,31 @@ env:
 
 jobs:
   lint:
-    name: Format & Clippy
-    runs-on: windows-latest
+    name: Format & Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # nokhwa/v4l2 needs the V4L headers, v4l2-sys-mit runs bindgen (libclang),
+      # enigo needs xkbcommon, and ureq's native-tls needs OpenSSL.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            clang \
+            libclang-dev \
+            libssl-dev \
+            libv4l-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -47,11 +68,30 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test
+    name: Test (${{ matrix.os }})
     needs: lint
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            clang \
+            libclang-dev \
+            libssl-dev \
+            libv4l-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
