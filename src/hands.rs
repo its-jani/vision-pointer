@@ -396,8 +396,7 @@ impl HandPipeline {
 
         let hand_side = self.hand.size;
         let mut plans = Vec::with_capacity(self.kept.len());
-        for index in 0..self.kept.len() {
-            let candidate = self.kept[index];
+        for &candidate in &self.kept {
             plans.push(plan_hand_roi(&candidate, frame_w, frame_h, hand_side));
         }
         Ok(plans)
