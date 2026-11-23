@@ -1,4 +1,4 @@
-# Vision Pointer — Gesture Daemon
+# Vision Pointer — Gesture Daemon 
 
 [![CI](https://github.com/its-jani/vision-pointer/actions/workflows/ci.yml/badge.svg)](https://github.com/its-jani/vision-pointer/actions/workflows/ci.yml)
 
